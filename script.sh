@@ -18,7 +18,6 @@ SPIN_CHARS='|/-\'
 SPIN_PID=""
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
-
 ok() { echo -e "${GN}${B0}✔${R0} $*"; }
 info() { echo -e "${CY}${B0}➜${R0} $*"; }
 warn() { echo -e "${YL}${B0}⚠${R0} $*"; }
@@ -86,7 +85,6 @@ ensure_docker() {
     ok "Docker найден"
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
-
   docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
   ok "Docker работает"
 }
@@ -125,17 +123,27 @@ normalize_domain() {
   echo "$d"
 }
 
-upsert_env_kv() {
+upsert_env_kv_with_blank_before() {
   local file="$1"
   local key="$2"
   local val="$3"
   mkdir -p "$(dirname "$file")"
   touch "$file"
+
   if grep -qE "^${key}=" "$file"; then
     sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
-  else
-    printf "%s=%s\n" "$key" "$val" >> "$file"
+    return 0
   fi
+
+  local last_line=""
+  if [[ -s "$file" ]]; then
+    last_line="$(tail -n 1 "$file" || true)"
+  fi
+
+  if [[ -n "$last_line" ]]; then
+    printf "\n" >> "$file"
+  fi
+  printf "%s=%s\n" "$key" "$val" >> "$file"
 }
 
 clone_or_update_repo() {
@@ -167,47 +175,68 @@ ensure_remnanode_paths() {
   ok "Логи remnanode: /var/log/remnanode"
 }
 
-render_vector_toml() {
+render_vector_toml_exact() {
   local domain="$1"
   local out="/opt/remnanode/vector.toml"
   local uri="https://${domain}:38213/"
 
   cat > "${out}" <<EOF
-[sources.remnanode_logs]
-type = "file"
-include = ["/var/log/remnanode/*.log"]
-read_from = "end"
-ignore_older_secs = 86400
+# Источник данных: указываем, откуда читать логи.
+# Мы будем читать access.log из директории, которую пробросим из remnanode.
+[sources.xray_access_logs]
+  type = "file"
+  # ВАЖНО: Путь внутри контейнера Vector. Мы пробросим /var/log/remnanode с хоста.
+  include = ["/var/log/remnanode/access.log"]
+  # Начинаем читать с конца файла, чтобы не обрабатывать старые записи при перезапуске
+  read_from = "end"
 
-[transforms.add_meta]
-type = "remap"
-inputs = ["remnanode_logs"]
-source = '''
-.host = get_hostname!()
-.ts = now()
-'''
+# Трансформация: парсим каждую строку лога, чтобы извлечь нужные данные.
+[transforms.parse_xray_log]
+  type = "remap"
+  inputs = ["xray_access_logs"]
+  source = '''
+    # (tcp:)? означает, что группа "tcp:" может присутствовать 0 или 1 раз.
+    pattern = r'from (tcp:)?(?P<ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}):\\d+.*? email: (?P<email>\\S+)'
 
-[sinks.to_observer]
-type = "http"
-inputs = ["add_meta"]
-uri = "${uri}"
-method = "post"
-encoding.codec = "json"
-batch.max_events = 100
-batch.timeout_secs = 5
-request.timeout_secs = 10
+    parsed, err = parse_regex(.message, pattern)
 
-[sinks.to_observer.tls]
-verify_certificate = true
-verify_hostname = true
+    if err != null {
+      log("Не удалось распарсить строку лога: " + err, level: "warn")
+      abort
+    }
+
+    . = {
+      "user_email": parsed.email,
+      "source_ip": parsed.ip,
+      "timestamp": to_string(now())
+    }
+  '''
+
+# Назначение: отправляем обработанные данные на наш центральный сервис-наблюдатель.
+[sinks.central_observer_api]
+  type = "http"
+  inputs = ["parse_xray_log"]
+  # ВАЖНО: Указываем HTTPS и ваш домен!
+  uri = "${uri}"
+  method = "post"
+  encoding.codec = "json"
+  compression = "gzip"
+
+  [sinks.central_observer_api.batch]
+    max_events = 100
+    timeout_secs = 5
+
+  [sinks.central_observer_api.request]
+    retry_attempts = 5
+    retry_backoff_secs = 2
+
+  [sinks.central_observer_api.tls]
 EOF
 
   ok "Создан /opt/remnanode/vector.toml → ${uri}"
 }
 
 patch_compose_add_services() {
-  local compose="/opt/remnanode/docker-compose.yml"
-
   python3 - <<'PY'
 import sys, os
 import yaml
@@ -298,8 +327,12 @@ print("CHANGED")
 PY
 }
 
-compose_up() {
-  start_spinner "Запускаю docker compose"
+compose_down_up() {
+  start_spinner "docker compose down"
+  (cd /opt/remnanode && docker compose down --remove-orphans) >/dev/null 2>&1 || true
+  stop_spinner_ok
+
+  start_spinner "docker compose up -d"
   (cd /opt/remnanode && docker compose up -d) >/dev/null
   stop_spinner_ok
 }
@@ -308,11 +341,11 @@ show_status() {
   echo -e "${WT}${B0}Состояние контейнеров:${R0}"
   (cd /opt/remnanode && docker compose ps) || true
   echo
-  echo -e "${WT}${B0}Логи blocker-xray (последние 60 строк):${R0}"
-  (cd /opt/remnanode && docker logs --tail 60 blocker-xray) || true
+  echo -e "${WT}${B0}Логи blocker-xray (последние 80 строк):${R0}"
+  (cd /opt/remnanode && docker logs --tail 80 blocker-xray) || true
   echo
-  echo -e "${WT}${B0}Логи vector (последние 60 строк):${R0}"
-  (cd /opt/remnanode && docker logs --tail 60 vector) || true
+  echo -e "${WT}${B0}Логи vector (последние 80 строк):${R0}"
+  (cd /opt/remnanode && docker logs --tail 80 vector) || true
 }
 
 main() {
@@ -324,7 +357,7 @@ main() {
   ensure_git_python_yaml
   ensure_docker
 
-  read_nonempty "Домен Observer (пример: obs.noctacore.com):" OBS_DOMAIN 0
+  read_nonempty "Домен Observer (пример: obsexp.core.com):" OBS_DOMAIN 0
   OBS_DOMAIN="$(normalize_domain "${OBS_DOMAIN}")"
 
   read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:38214/):" RABBITMQ_URL 0
@@ -332,9 +365,10 @@ main() {
   clone_or_update_repo
   ensure_remnanode_paths
 
-  upsert_env_kv "/opt/remnanode/.env" "RABBITMQ_URL" "${RABBITMQ_URL}"
+  upsert_env_kv_with_blank_before "/opt/remnanode/.env" "RABBITMQ_URL" "${RABBITMQ_URL}"
+  ok "Обновлён /opt/remnanode/.env (RABBITMQ_URL добавлен с пустой строкой перед ним, если файл не пустой)"
 
-  render_vector_toml "${OBS_DOMAIN}"
+  render_vector_toml_exact "${OBS_DOMAIN}"
 
   start_spinner "Правлю /opt/remnanode/docker-compose.yml (добавляю blocker-xray и vector)"
   out="$(patch_compose_add_services || true)"
@@ -345,15 +379,11 @@ main() {
     ok "docker-compose.yml обновлён"
   fi
 
-  compose_up
+  compose_down_up
 
   ok "Готово"
   echo
   show_status
-
-  echo -e "${GN}${B0}Дальше:${R0}"
-  echo -e "  ${WT}• Проверка очереди/связи RabbitMQ: смотри логи blocker-xray${R0}"
-  echo -e "  ${WT}• Проверка доставки логов: смотри логи vector и на стороне observer — логи vector-aggregator/observer${R0}"
   echo
 }
 
