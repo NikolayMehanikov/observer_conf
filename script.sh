@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 export LC_ALL=C
 
 R0=$'\033[0m'
@@ -18,6 +19,7 @@ SPIN_PID=""
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
 ok() { echo -e "${GN}${B0}✔${R0} $*"; }
+info() { echo -e "${CY}${B0}➜${R0} $*"; }
 warn() { echo -e "${YL}${B0}⚠${R0} $*"; }
 
 start_spinner() {
@@ -53,13 +55,16 @@ stop_spinner_fail() {
 }
 
 on_err() {
-  stop_spinner_fail
+  stop_spinner_fail || true
   echo -e "${RD}${B0}Ошибка${R0}: команда завершилась неуспешно."
   echo -e "${D0}Строка:${R0} ${BASH_LINENO[0]}  ${D0}Команда:${R0} ${BASH_COMMAND}"
 }
 trap on_err ERR
 
-require_root() { [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"; }
+require_root() {
+  [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"
+}
+
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
 apt_install() {
@@ -88,21 +93,13 @@ read_nonempty() {
   printf -v "${varname}" '%s' "${value}"
 }
 
-normalize_domain() {
-  local d="$1"
-  d="${d#http://}"
-  d="${d#https://}"
-  d="${d%%/*}"
-  echo "$d"
-}
-
 validate_port() {
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || return 1
   (( p >= 1 && p <= 65535 ))
 }
 
-validate_ipv4() {
+validate_ipv4_one() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   local a b c d
@@ -113,12 +110,30 @@ validate_ipv4() {
   done
 }
 
-backup_file() {
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  local ts
-  ts="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$f" "${f}.bak.${ts}"
+normalize_ipv4_list_to_nft_elements() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(echo "$raw" | tr ',;' '  ' | tr -s ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  [[ -n "$cleaned" ]] || die "IP список пустой"
+  local out=()
+  local ip
+  while read -r ip; do
+    [[ -n "$ip" ]] || continue
+    validate_ipv4_one "$ip" || die "Невалидный IPv4: $ip"
+    out+=("$ip")
+  done < <(echo "$cleaned" | tr ' ' '\n' | sed '/^$/d')
+  [[ "${#out[@]}" -gt 0 ]] || die "IP список пустой"
+  local joined=""
+  local i=0
+  for ip in "${out[@]}"; do
+    if (( i == 0 )); then
+      joined="$ip"
+    else
+      joined="$joined, $ip"
+    fi
+    i=$((i+1))
+  done
+  echo "$joined"
 }
 
 ensure_git_python_yaml() {
@@ -138,21 +153,35 @@ ensure_docker() {
   else
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
-
   docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
-
-  if ! docker compose version >/dev/null 2>&1; then
-    apt_install docker-compose-plugin
-  fi
-
   ok "Docker работает"
 }
 
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$f" "${f}.bak.${ts}"
+}
+
 detect_ssh_unit() {
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
+    echo "ssh"
+    return 0
+  fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
+    echo "sshd"
+    return 0
+  fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
+    echo "ssh"
+    return 0
+  fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
+    echo "sshd"
+    return 0
+  fi
   return 1
 }
 
@@ -170,12 +199,10 @@ ensure_sshd_include_dropins() {
 comment_out_other_port_directives() {
   local keep_file="$1"
   local main_cfg="/etc/ssh/sshd_config"
-
   if grep -Eiq '^\s*Port\s+[0-9]+' "$main_cfg"; then
     backup_file "$main_cfg"
     sed -i -E 's/^\s*(Port\s+[0-9]+)\s*$/# \1/Ig' "$main_cfg"
   fi
-
   shopt -s nullglob
   local f
   for f in /etc/ssh/sshd_config.d/*.conf; do
@@ -188,46 +215,46 @@ comment_out_other_port_directives() {
   shopt -u nullglob
 }
 
-ensure_run_sshd() {
+ensure_run_sshd_dir() {
   mkdir -p /run/sshd
   chmod 0755 /run/sshd
+  chown root:root /run/sshd
 }
 
 restart_ssh_and_verify() {
   local unit="$1"
   local new_port="$2"
 
-  ensure_run_sshd
   systemctl daemon-reload >/dev/null 2>&1 || true
-
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
     systemctl restart ssh.socket >/dev/null 2>&1 || true
   fi
+
+  ensure_run_sshd_dir
 
   systemctl restart "${unit}" >/dev/null
 
   systemctl is-active --quiet "${unit}" || {
     echo -e "${RD}${B0}SSH unit не активен после рестарта.${R0}"
-    journalctl -u "${unit}" -n 140 --no-pager || true
+    echo -e "${WT}${B0}Последние логи systemd (${unit}):${R0}"
+    journalctl -u "${unit}" -n 120 --no-pager || true
     die "SSH не поднялся после применения конфига"
   }
 
-  cmd_exists ss || apt_install iproute2
+  if ! cmd_exists ss; then
+    apt_install iproute2
+  fi
 
   if ! ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${new_port}\b"; then
     echo -e "${RD}${B0}sshd не слушает порт ${new_port}.${R0}"
+    echo -e "${WT}${B0}ss -lntp (ssh):${R0}"
     ss -lntp 2>/dev/null | grep -i ssh || ss -lntp 2>/dev/null || true
-    echo -e "${WT}${B0}Эффективная конфигурация sshd (port):${R0}"
+    echo -e "${WT}${B0}Эффективная конфигурация sshd (ports):${R0}"
     sshd -T 2>/dev/null | awk '/^port /{print}' || true
+    echo -e "${WT}${B0}Последние логи systemd (${unit}):${R0}"
     journalctl -u "${unit}" -n 160 --no-pager || true
     die "Порт не применился / sshd не слушает новый порт"
   fi
-}
-
-set_root_password() {
-  echo -e "${CY}${B0}ROOT пароль:${R0}"
-  passwd root
-  ok "Пароль root изменён"
 }
 
 ssh_hardening_port() {
@@ -241,8 +268,8 @@ ssh_hardening_port() {
 
   mkdir -p "${dropin_dir}"
   ensure_sshd_include_dropins
-  backup_file "${dropin_file}"
 
+  backup_file "${dropin_file}"
   cat > "${dropin_file}" <<EOF
 Port ${new_port}
 PermitRootLogin yes
@@ -259,7 +286,8 @@ EOF
 
   comment_out_other_port_directives "${dropin_file}"
 
-  ensure_run_sshd
+  ensure_run_sshd_dir
+
   if ! sshd -t >/dev/null 2>&1; then
     stop_spinner_fail
     sshd -t || true
@@ -267,7 +295,7 @@ EOF
   fi
 
   local unit
-  unit="$(detect_ssh_unit)" || { stop_spinner_fail; die "Не нашёл systemd unit ssh/sshd. Проверь systemctl status ssh sshd"; }
+  unit="$(detect_ssh_unit)" || { stop_spinner_fail; die "Не нашёл systemd unit ssh/sshd."; }
 
   restart_ssh_and_verify "${unit}" "${new_port}"
 
@@ -283,7 +311,6 @@ setup_fail2ban() {
   cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
-port = ${SSH_PORT}
 bantime = 30m
 findtime = 10m
 maxretry = 5
@@ -320,180 +347,6 @@ disable_ufw() {
   ok "UFW выключен"
 }
 
-disable_netfilter_persistent() {
-  start_spinner "Отключение netfilter-persistent"
-  systemctl stop netfilter-persistent >/dev/null 2>&1 || true
-  systemctl disable netfilter-persistent >/dev/null 2>&1 || true
-  stop_spinner_ok
-  ok "netfilter-persistent выключен"
-}
-
-detect_docker_bridge_ifaces() {
-  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^docker0$|^br-' || true
-}
-
-setup_nftables_firewall() {
-  local ssh_port="$1"
-  local control_ip="$2"
-  local monitoring_ip="$3"
-
-  validate_port "$ssh_port" || die "Неверный SSH порт для nftables"
-  validate_ipv4 "$control_ip" || die "Неверный IPv4 control_plane_sources: $control_ip"
-  validate_ipv4 "$monitoring_ip" || die "Неверный IPv4 monitoring_sources: $monitoring_ip"
-
-  apt_install nftables
-
-  local ifaces
-  ifaces="$(detect_docker_bridge_ifaces)"
-  local forward_rules=""
-  if [[ -n "${ifaces}" ]]; then
-    while IFS= read -r iface; do
-      [[ -z "${iface}" ]] && continue
-      forward_rules+=$'        iifname "'"${iface}"$'" accept comment "Allow docker bridge traffic"\n'
-      forward_rules+=$'        oifname "'"${iface}"$'" tcp dport $WEB_PORTS ct state new accept comment "Allow new TCP to docker web ports"\n'
-      forward_rules+=$'        oifname "'"${iface}"$'" udp dport 443 ct state new accept comment "Allow new UDP/443 (QUIC) to docker"\n'
-    done <<< "${ifaces}"
-  fi
-
-  start_spinner "Настройка nftables (/etc/nftables.conf)"
-  backup_file /etc/nftables.conf
-
-  cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-
-flush ruleset
-
-define SSH_PORT = ${ssh_port}
-define CONTROL_PORT = 4431
-define MONITORING_PORT = 9100
-define WEB_PORTS = { 80, 443 }
-
-table inet firewall {
-
-    set ddos_blacklist {
-        type ipv4_addr
-        flags timeout
-        timeout 5m
-        size 8192
-        comment "Dynamic blacklist for DDoS sources"
-    }
-
-    set user_blacklist {
-        type ipv4_addr
-        flags timeout
-        size 8192
-        comment "Dynamic blacklist for subscription policy violators"
-    }
-
-    set control_plane_sources {
-        type ipv4_addr
-        elements = { ${control_ip} }
-    }
-
-    set monitoring_sources {
-        type ipv4_addr
-        elements = { ${monitoring_ip} }
-    }
-
-    set tls_flood_sources {
-        type ipv4_addr
-        flags timeout
-        timeout 15m
-        size 4096
-    }
-
-    chain prerouting {
-        type filter hook prerouting priority raw; policy accept;
-
-        ip saddr @user_blacklist drop comment "Drop traffic from policy violators"
-
-        ip6 version 6 drop comment "Block IPv6 completely"
-        iif != lo ip saddr 127.0.0.0/8 drop comment "Block spoofed loopback from external"
-        ip frag-off & 0x1fff != 0 drop comment "Drop fragmented packets"
-
-        tcp flags & (fin|syn|rst|psh|ack|urg) == 0 drop comment "Drop NULL packets"
-        tcp flags & (fin|syn|rst|psh|ack|urg) == fin|syn|rst|psh|ack|urg drop comment "Drop XMAS packets"
-        tcp flags & (syn|rst) == syn|rst drop comment "Drop SYN+RST packets"
-        tcp flags & (syn|fin) == syn|fin drop comment "Drop SYN+FIN packets"
-
-        fib daddr type broadcast drop comment "Drop broadcast early"
-        fib daddr type multicast drop comment "Drop multicast early"
-        fib daddr type anycast   drop comment "Drop anycast early"
-
-        ip saddr @ddos_blacklist drop comment "Drop blacklisted source early"
-
-        tcp dport \$SSH_PORT tcp flags & (syn|ack) == syn limit rate 5/second burst 3 packets accept comment "SSH SYN flood limit"
-        tcp dport \$SSH_PORT tcp flags & (syn|ack) == syn add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist SSH flooders"
-
-        ip protocol icmp icmp type echo-request limit rate 2/second burst 2 packets accept comment "Allow limited ping"
-        ip protocol icmp icmp type echo-request add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist ping flooders"
-    }
-
-    chain forward {
-        type filter hook forward priority filter; policy drop;
-        ct state established,related accept comment "Allow established forward"
-${forward_rules}        drop comment "Drop forward"
-    }
-
-    chain output {
-        type filter hook output priority filter; policy accept;
-    }
-
-    chain filter_input {
-        type filter hook input priority filter; policy drop;
-
-        iif lo accept comment "Allow loopback"
-        ct state invalid drop comment "Drop invalid packets"
-        ct state established,related accept comment "Allow established"
-
-        ip saddr @ddos_blacklist drop comment "Drop known DDoS sources"
-
-        tcp dport \$WEB_PORTS ct count over 100 drop comment "Limit concurrent web connections"
-        tcp dport \$SSH_PORT ct count over 15 drop comment "Limit SSH connections"
-        ct count over 100 drop comment "Limit total connections per IP"
-
-        tcp dport \$SSH_PORT ct state new meter ssh_meter { ip saddr limit rate 5/minute burst 3 packets } accept comment "SSH rate limit"
-        tcp dport \$SSH_PORT ct state new add @ddos_blacklist { ip saddr timeout 5m } drop comment "SSH flood → blacklist"
-
-        ip saddr @control_plane_sources tcp dport \$CONTROL_PORT ct state new accept comment "Control plane"
-        ip saddr @monitoring_sources tcp dport \$MONITORING_PORT ct state new accept comment "Monitoring"
-
-        ip saddr @tls_flood_sources drop comment "Drop TLS flooded IPs"
-        tcp dport 443 ct state new meter tls_meter { ip saddr limit rate 400/second burst 300 packets } accept comment "TLS connections"
-        tcp dport 443 ct state new add @tls_flood_sources { ip saddr timeout 5m } drop comment "TLS flood → temp block"
-
-        tcp dport 80 ct state new meter cert_meter { ip saddr limit rate 5/minute burst 3 packets } accept comment "HTTP cert renewal"
-
-        drop comment "Default drop"
-    }
-}
-EOF
-
-  if ! nft -c -f /etc/nftables.conf >/dev/null 2>&1; then
-    stop_spinner_fail
-    nft -c -f /etc/nftables.conf || true
-    die "nftables.conf невалиден"
-  fi
-
-  if ! nft -f /etc/nftables.conf >/dev/null 2>&1; then
-    stop_spinner_fail
-    nft -f /etc/nftables.conf || true
-    die "Не удалось применить правила nft"
-  fi
-
-  systemctl enable nftables >/dev/null 2>&1 || true
-  systemctl restart nftables >/dev/null
-
-  systemctl is-active --quiet nftables || {
-    stop_spinner_fail
-    systemctl status nftables --no-pager || true
-    die "nftables не активен после рестарта"
-  }
-
-  stop_spinner_ok
-  ok "nftables настроен и применён"
-}
-
 clone_or_update_repo() {
   local dst="/opt/remnawave-observer"
   local url="https://github.com/0FL01/remnawave-observer.git"
@@ -513,6 +366,155 @@ clone_or_update_repo() {
   ok "Репозиторий готов: ${dst}"
 }
 
+apply_nftables_from_repo_example() {
+  local ssh_port="$1"
+  local control_ips_csv="$2"
+  local monitoring_ips_csv="$3"
+
+  local src="/opt/remnawave-observer/nftables_example.conf"
+  [[ -f "$src" ]] || die "Не найден ${src}"
+
+  local control_elems
+  local monitoring_elems
+  control_elems="$(normalize_ipv4_list_to_nft_elements "$control_ips_csv")"
+  monitoring_elems="$(normalize_ipv4_list_to_nft_elements "$monitoring_ips_csv")"
+
+  start_spinner "Готовлю /etc/nftables.conf из nftables_example.conf"
+
+  backup_file /etc/nftables.conf
+
+  python3 - "$src" "$ssh_port" "$control_elems" "$monitoring_elems" <<'PY'
+import sys, re
+
+src = sys.argv[1]
+ssh_port = sys.argv[2]
+control = sys.argv[3]
+monitoring = sys.argv[4]
+
+with open(src, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+out = []
+in_control = False
+in_monitor = False
+
+re_define_ssh = re.compile(r'^\s*define\s+SSH_PORT\s*=\s*\d+\s*$')
+re_set_control = re.compile(r'^\s*set\s+control_plane_sources\s*\{')
+re_set_monitor = re.compile(r'^\s*set\s+monitoring_sources\s*\{')
+re_elements = re.compile(r'^(\s*elements\s*=\s*\{\s*)(.*?)(\s*\}\s*;?\s*)$')
+
+for line in lines:
+    if re_define_ssh.match(line.strip()):
+        out.append(re.sub(r'\d+', ssh_port, line))
+        continue
+
+    if re_set_control.search(line):
+        in_control = True
+        in_monitor = False
+        out.append(line)
+        continue
+
+    if re_set_monitor.search(line):
+        in_monitor = True
+        in_control = False
+        out.append(line)
+        continue
+
+    m = re_elements.match(line)
+    if m and in_control:
+        out.append(m.group(1) + control + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+        continue
+
+    if m and in_monitor:
+        out.append(m.group(1) + monitoring + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+        continue
+
+    if in_control and line.strip().startswith("}"):
+        in_control = False
+    if in_monitor and line.strip().startswith("}"):
+        in_monitor = False
+
+    out.append(line)
+
+sys.stdout.write("".join(out))
+PY
+  stop_spinner_ok > /tmp/.nft_gen.log 2>/dev/null || true
+
+  python3 - "$src" "$ssh_port" "$control_elems" "$monitoring_elems" > /etc/nftables.conf <<'PY'
+import sys, re
+
+src = sys.argv[1]
+ssh_port = sys.argv[2]
+control = sys.argv[3]
+monitoring = sys.argv[4]
+
+with open(src, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+out = []
+in_control = False
+in_monitor = False
+
+re_define_ssh = re.compile(r'^\s*define\s+SSH_PORT\s*=\s*\d+\s*$')
+re_set_control = re.compile(r'^\s*set\s+control_plane_sources\s*\{')
+re_set_monitor = re.compile(r'^\s*set\s+monitoring_sources\s*\{')
+re_elements = re.compile(r'^(\s*elements\s*=\s*\{\s*)(.*?)(\s*\}\s*;?\s*)$')
+
+for line in lines:
+    if re_define_ssh.match(line.strip()):
+        out.append(re.sub(r'\d+', ssh_port, line))
+        continue
+
+    if re_set_control.search(line):
+        in_control = True
+        in_monitor = False
+        out.append(line)
+        continue
+
+    if re_set_monitor.search(line):
+        in_monitor = True
+        in_control = False
+        out.append(line)
+        continue
+
+    m = re_elements.match(line)
+    if m and in_control:
+        out.append(m.group(1) + control + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+        continue
+
+    if m and in_monitor:
+        out.append(m.group(1) + monitoring + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+        continue
+
+    if in_control and line.strip().startswith("}"):
+        in_control = False
+    if in_monitor and line.strip().startswith("}"):
+        in_monitor = False
+
+    out.append(line)
+
+sys.stdout.write("".join(out))
+PY
+
+  start_spinner "Проверка синтаксиса nftables"
+  nft -c -f /etc/nftables.conf >/dev/null
+  stop_spinner_ok
+
+  start_spinner "Применение nftables + enable"
+  nft -f /etc/nftables.conf >/dev/null
+  systemctl enable nftables >/dev/null 2>&1 || true
+  systemctl restart nftables >/dev/null 2>&1 || true
+  stop_spinner_ok
+
+  ok "nftables применён из репозитория (структура сохранена), подставлены IP и SSH_PORT"
+}
+
+set_root_password() {
+  echo -e "${CY}${B0}ROOT пароль:${R0}"
+  passwd root
+  ok "Пароль root изменён"
+}
+
 ensure_remnanode_paths() {
   [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode"
   [[ -f /opt/remnanode/docker-compose.yml ]] || die "Не найден /opt/remnanode/docker-compose.yml"
@@ -530,29 +532,20 @@ upsert_env_kv_with_blank_before() {
   mkdir -p "$(dirname "$file")"
   touch "$file"
 
-  python3 - <<PY
-import os
-path = "${file}"
-key = "${key}"
-val = "${val}"
-with open(path, "r", encoding="utf-8", errors="ignore") as f:
-    lines = f.read().splitlines()
+  if grep -qE "^${key}=" "$file"; then
+    sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
+    return 0
+  fi
 
-out = []
-for line in lines:
-    if line.startswith(key + "="):
-        continue
-    out.append(line)
+  local last_line=""
+  if [[ -s "$file" ]]; then
+    last_line="$(tail -n 1 "$file" || true)"
+  fi
 
-if out and out[-1].strip() != "":
-    out.append("")
-out.append(f"{key}={val}")
-
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    f.write("\n".join(out) + "\n")
-os.replace(tmp, path)
-PY
+  if [[ -n "$last_line" ]]; then
+    printf "\n" >> "$file"
+  fi
+  printf "%s=%s\n" "$key" "$val" >> "$file"
 }
 
 render_vector_toml_exact() {
@@ -717,98 +710,63 @@ compose_down_up() {
   stop_spinner_ok
 }
 
-verify_everything() {
-  start_spinner "Проверка: nftables / ssh / docker"
-  systemctl is-active --quiet nftables || { stop_spinner_fail; die "nftables не активен"; }
-
-  local eff_port
-  eff_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
-  [[ "${eff_port:-}" == "${SSH_PORT}" ]] || { stop_spinner_fail; die "sshd effective port=${eff_port:-?} не равен ${SSH_PORT}"; }
-
-  ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${SSH_PORT}\b" || { stop_spinner_fail; die "порт ${SSH_PORT} не слушается"; }
-
-  nft list ruleset 2>/dev/null | grep -qE 'table inet firewall' || { stop_spinner_fail; die "в ruleset не найден table inet firewall"; }
-  nft list ruleset 2>/dev/null | grep -qE 'set user_blacklist' || { stop_spinner_fail; die "в ruleset не найден set user_blacklist"; }
-
-  (cd /opt/remnanode && docker compose ps >/dev/null 2>&1) || { stop_spinner_fail; die "docker compose ps не выполняется"; }
-  docker ps --format '{{.Names}} {{.Status}}' | grep -q '^blocker-xray ' || { stop_spinner_fail; die "контейнер blocker-xray не найден"; }
-  docker ps --format '{{.Names}} {{.Status}}' | grep -q '^vector ' || { stop_spinner_fail; die "контейнер vector не найден"; }
-
-  stop_spinner_ok
-  ok "Проверки прошли"
-}
-
-show_status_and_logs() {
-  echo -e "${WT}${B0}Состояние docker compose:${R0}"
+show_logs_and_status() {
+  echo -e "${WT}${B0}docker compose ps:${R0}"
   (cd /opt/remnanode && docker compose ps) || true
   echo
-
-  echo -e "${WT}${B0}Последние логи blocker-xray (200 строк):${R0}"
-  docker logs --tail 200 blocker-xray 2>/dev/null || true
+  echo -e "${WT}${B0}Логи blocker-xray (tail 160):${R0}"
+  docker logs --tail 160 blocker-xray 2>/dev/null || true
   echo
-
-  echo -e "${WT}${B0}Последние логи vector (200 строк):${R0}"
-  docker logs --tail 200 vector 2>/dev/null || true
-  echo
-
-  if cmd_exists timeout; then
-    echo -e "${CY}${B0}Онлайн логи blocker-xray (15s):${R0}"
-    timeout 15s docker logs -f blocker-xray 2>/dev/null || true
-    echo
-    echo -e "${CY}${B0}Онлайн логи vector (15s):${R0}"
-    timeout 15s docker logs -f vector 2>/dev/null || true
-    echo
-  fi
+  echo -e "${WT}${B0}Логи vector (tail 160):${R0}"
+  docker logs --tail 160 vector 2>/dev/null || true
 }
 
 main() {
   require_root
 
   clear || true
-  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (nftables) ===${R0}"
+  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (repo-first) ===${R0}"
   echo
 
-  cmd_exists apt-get || die "Нужен Debian/Ubuntu (apt-get не найден)."
-
+  apt_install ca-certificates curl iproute2 openssh-server coreutils nftables
   ensure_git_python_yaml
   ensure_docker
-  apt_install ca-certificates curl iproute2 openssh-server coreutils
 
   read_nonempty "Новый SSH порт (например 50012):" SSH_PORT 0
   validate_port "${SSH_PORT}" || die "Порт невалидный"
 
-  read_nonempty "IPv4 адрес главного сервера (Control plane, для nftables):" CONTROL_IP 0
-  validate_ipv4 "${CONTROL_IP}" || die "IPv4 невалидный"
-
-  read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же):" MON_IP 0
-  validate_ipv4 "${MON_IP}" || die "IPv4 невалидный"
+  read_nonempty "IPv4 адрес главного сервера (Control plane, для nftables) (можно несколько через запятую):" CONTROL_IPS 0
+  read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
 
   echo
   set_root_password
   echo
 
+  ensure_run_sshd_dir
   ssh_hardening_port "${SSH_PORT}"
+
+  clone_or_update_repo
+  apply_nftables_from_repo_example "${SSH_PORT}" "${CONTROL_IPS}" "${MONITOR_IPS}"
+
   setup_fail2ban
   setup_sysctl
   disable_ufw
-  disable_netfilter_persistent
-
-  setup_nftables_firewall "${SSH_PORT}" "${CONTROL_IP}" "${MON_IP}"
 
   echo
-  echo -e "${MG}${B0}=== Установка Blocker + Vector ===${R0}"
+  echo -e "${MG}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
   echo
 
   read_nonempty "Домен центрального Observer (пример: obs.noctacore.com):" OBS_DOMAIN 0
-  OBS_DOMAIN="$(normalize_domain "${OBS_DOMAIN}")"
+  OBS_DOMAIN="$(echo "$OBS_DOMAIN" | sed -E 's#^https?://##; s#/.*$##')"
+  [[ -n "$OBS_DOMAIN" ]] || die "Домен пустой"
 
   read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:38214/):" RABBITMQ_URL 0
+  [[ -n "$RABBITMQ_URL" ]] || die "RabbitMQ URL пустой"
 
-  clone_or_update_repo
   ensure_remnanode_paths
 
   upsert_env_kv_with_blank_before "/opt/remnanode/.env" "RABBITMQ_URL" "${RABBITMQ_URL}"
-  ok "Обновлён /opt/remnanode/.env"
+  ok "Обновлён /opt/remnanode/.env (RABBITMQ_URL добавлен с пустой строкой перед ним, если файл не пустой)"
 
   render_vector_toml_exact "${OBS_DOMAIN}"
 
@@ -822,14 +780,13 @@ main() {
   fi
 
   compose_down_up
-  verify_everything
 
   echo
   ok "Готово"
   echo
-  show_status_and_logs
+  show_logs_and_status
   echo
-  echo -e "${YL}${B0}Проверь вход в новой SSH-сессии:${R0} ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
+  echo -e "${YL}${B0}Проверь вход в новой сессии SSH:${R0} ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
 }
 
 main "$@"
