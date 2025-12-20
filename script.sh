@@ -75,28 +75,6 @@ apt_install() {
   stop_spinner_ok
 }
 
-ensure_docker() {
-  if ! cmd_exists docker; then
-    warn "Docker не найден. Ставлю docker.io + compose plugin."
-    apt_install ca-certificates curl gnupg lsb-release
-    apt_install docker.io docker-compose-plugin
-    systemctl enable --now docker >/dev/null 2>&1 || true
-  else
-    ok "Docker найден"
-    systemctl enable --now docker >/dev/null 2>&1 || true
-  fi
-  docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
-  ok "Docker работает"
-}
-
-ensure_git_python_yaml() {
-  local need=()
-  cmd_exists git || need+=(git)
-  cmd_exists python3 || need+=(python3)
-  python3 -c "import yaml" >/dev/null 2>&1 || need+=(python3-yaml)
-  ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
-}
-
 read_nonempty() {
   local prompt="$1"
   local varname="$2"
@@ -123,27 +101,118 @@ normalize_domain() {
   echo "$d"
 }
 
-upsert_env_kv_with_blank_before() {
-  local file="$1"
-  local key="$2"
-  local val="$3"
-  mkdir -p "$(dirname "$file")"
-  touch "$file"
+validate_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 ))
+}
 
-  if grep -qE "^${key}=" "$file"; then
-    sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
-    return 0
-  fi
+ensure_git_python_yaml() {
+  local need=()
+  cmd_exists git || need+=(git)
+  cmd_exists python3 || need+=(python3)
+  python3 -c "import yaml" >/dev/null 2>&1 || need+=(python3-yaml)
+  ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
+}
 
-  local last_line=""
-  if [[ -s "$file" ]]; then
-    last_line="$(tail -n 1 "$file" || true)"
+ensure_docker() {
+  if ! cmd_exists docker; then
+    warn "Docker не найден. Ставлю docker.io + compose plugin."
+    apt_install ca-certificates curl gnupg lsb-release
+    apt_install docker.io docker-compose-plugin
+    systemctl enable --now docker >/dev/null 2>&1 || true
+  else
+    ok "Docker найден"
+    systemctl enable --now docker >/dev/null 2>&1 || true
   fi
+  docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
+  ok "Docker работает"
+}
 
-  if [[ -n "$last_line" ]]; then
-    printf "\n" >> "$file"
-  fi
-  printf "%s=%s\n" "$key" "$val" >> "$file"
+set_root_password() {
+  echo -e "${CY}${B0}ROOT пароль:${R0}"
+  passwd root
+  ok "Пароль root изменён"
+}
+
+ssh_hardening_port() {
+  local new_port="$1"
+  validate_port "$new_port" || die "Неверный порт SSH: $new_port"
+
+  start_spinner "Настройка SSH (порт ${new_port})"
+  mkdir -p /etc/ssh/sshd_config.d
+  cat > /etc/ssh/sshd_config.d/99-custom.conf <<EOF
+Port ${new_port}
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication yes
+PrintMotd no
+Banner none
+EOF
+  rm -f /etc/issue /etc/issue.net
+  : > /etc/issue
+  : > /etc/issue.net
+
+  sshd -t >/dev/null 2>&1 || { stop_spinner_fail; die "sshd_config невалиден. Вернул назад? Проверь /etc/ssh/sshd_config.d/99-custom.conf"; }
+  systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "SSH применён. Новый порт: ${new_port}"
+  echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии: ${B0}ssh -p ${new_port} root@<IP>${R0}"
+}
+
+setup_fail2ban() {
+  apt_install fail2ban
+  start_spinner "Настройка Fail2Ban"
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+bantime = 30m
+findtime = 10m
+maxretry = 5
+backend = systemd
+EOF
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "Fail2Ban активирован"
+}
+
+setup_sysctl() {
+  start_spinner "Применение sysctl"
+  cat > /etc/sysctl.d/99-hardening.conf <<EOF
+net.ipv4.icmp_echo_ignore_all = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "sysctl применён"
+}
+
+setup_iptables_antiscam() {
+  apt_install iptables-persistent
+  start_spinner "iptables anti-scan"
+  iptables -C INPUT -p tcp --tcp-flags ALL NONE -j DROP >/dev/null 2>&1 || iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP
+  iptables -C INPUT -p tcp ! --syn -m state --state NEW -j DROP >/dev/null 2>&1 || iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
+  iptables -C INPUT -p tcp --tcp-flags ALL ALL -j DROP >/dev/null 2>&1 || iptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP
+  netfilter-persistent save >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "iptables правила применены"
+}
+
+disable_ufw() {
+  start_spinner "Отключение UFW"
+  systemctl stop ufw >/dev/null 2>&1 || true
+  systemctl disable ufw >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "UFW выключен"
 }
 
 clone_or_update_repo() {
@@ -166,13 +235,36 @@ clone_or_update_repo() {
 }
 
 ensure_remnanode_paths() {
-  [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode (должен существовать с твоим remnanode docker-compose.yml)"
+  [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode"
   [[ -f /opt/remnanode/docker-compose.yml ]] || die "Не найден /opt/remnanode/docker-compose.yml"
 
   mkdir -p /var/log/remnanode
   chown -R 1000:1000 /var/log/remnanode >/dev/null 2>&1 || true
   chmod 755 /var/log/remnanode >/dev/null 2>&1 || true
   ok "Логи remnanode: /var/log/remnanode"
+}
+
+upsert_env_kv_with_blank_before() {
+  local file="$1"
+  local key="$2"
+  local val="$3"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+
+  if grep -qE "^${key}=" "$file"; then
+    sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
+    return 0
+  fi
+
+  local last_line=""
+  if [[ -s "$file" ]]; then
+    last_line="$(tail -n 1 "$file" || true)"
+  fi
+
+  if [[ -n "$last_line" ]]; then
+    printf "\n" >> "$file"
+  fi
+  printf "%s=%s\n" "$key" "$val" >> "$file"
 }
 
 render_vector_toml_exact() {
@@ -257,7 +349,7 @@ if not isinstance(services, dict):
     raise SystemExit("services в docker-compose.yml не словарь")
 
 if "remnanode" not in services:
-    raise SystemExit("В docker-compose.yml не найден сервис 'remnanode' (нужен для depends_on)")
+    raise SystemExit("В docker-compose.yml не найден сервис 'remnanode'")
 
 blocker = {
   "container_name": "blocker-xray",
@@ -341,23 +433,41 @@ show_status() {
   echo -e "${WT}${B0}Состояние контейнеров:${R0}"
   (cd /opt/remnanode && docker compose ps) || true
   echo
-  echo -e "${WT}${B0}Логи blocker-xray (последние 80 строк):${R0}"
-  (cd /opt/remnanode && docker logs --tail 80 blocker-xray) || true
+  echo -e "${WT}${B0}Логи blocker-xray (последние 120 строк):${R0}"
+  (cd /opt/remnanode && docker logs --tail 120 blocker-xray) || true
   echo
-  echo -e "${WT}${B0}Логи vector (последние 80 строк):${R0}"
-  (cd /opt/remnanode && docker logs --tail 80 vector) || true
+  echo -e "${WT}${B0}Логи vector (последние 120 строк):${R0}"
+  (cd /opt/remnanode && docker logs --tail 120 vector) || true
 }
 
 main() {
   require_root
 
-  echo -e "${CY}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
+  clear || true
+  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer ===${R0}"
   echo
 
   ensure_git_python_yaml
   ensure_docker
 
-  read_nonempty "Домен Observer (пример: obsexp.core.com):" OBS_DOMAIN 0
+  read_nonempty "Новый SSH порт (например 50012):" SSH_PORT 0
+  validate_port "${SSH_PORT}" || die "Порт невалидный"
+
+  echo
+  set_root_password
+  echo
+
+  ssh_hardening_port "${SSH_PORT}"
+  setup_fail2ban
+  setup_sysctl
+  setup_iptables_antiscam
+  disable_ufw
+
+  echo
+  echo -e "${MG}${B0}=== Установка Blocker + Vector ===${R0}"
+  echo
+
+  read_nonempty "Домен центрального Observer (пример: obs.noctacore.com):" OBS_DOMAIN 0
   OBS_DOMAIN="$(normalize_domain "${OBS_DOMAIN}")"
 
   read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:38214/):" RABBITMQ_URL 0
@@ -370,21 +480,23 @@ main() {
 
   render_vector_toml_exact "${OBS_DOMAIN}"
 
-  start_spinner "Правлю /opt/remnanode/docker-compose.yml (добавляю blocker-xray и vector)"
+  start_spinner "Правлю /opt/remnanode/docker-compose.yml (blocker-xray + vector)"
   out="$(patch_compose_add_services || true)"
   stop_spinner_ok
   if [[ "${out:-}" == "NOCHANGE" ]]; then
-    ok "docker-compose.yml уже содержит blocker-xray/vector — пропускаю вставку"
+    ok "docker-compose.yml уже содержит blocker-xray/vector"
   else
     ok "docker-compose.yml обновлён"
   fi
 
   compose_down_up
 
+  echo
   ok "Готово"
   echo
   show_status
   echo
+  echo -e "${YL}${B0}Проверь:${R0} в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
 }
 
 main "$@"
