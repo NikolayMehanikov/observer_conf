@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 export LC_ALL=C
 
 R0=$'\033[0m'
@@ -189,11 +188,18 @@ comment_out_other_port_directives() {
   shopt -u nullglob
 }
 
+ensure_run_sshd() {
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+}
+
 restart_ssh_and_verify() {
   local unit="$1"
   local new_port="$2"
 
+  ensure_run_sshd
   systemctl daemon-reload >/dev/null 2>&1 || true
+
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
     systemctl restart ssh.socket >/dev/null 2>&1 || true
   fi
@@ -202,7 +208,7 @@ restart_ssh_and_verify() {
 
   systemctl is-active --quiet "${unit}" || {
     echo -e "${RD}${B0}SSH unit не активен после рестарта.${R0}"
-    journalctl -u "${unit}" -n 120 --no-pager || true
+    journalctl -u "${unit}" -n 140 --no-pager || true
     die "SSH не поднялся после применения конфига"
   }
 
@@ -213,7 +219,7 @@ restart_ssh_and_verify() {
     ss -lntp 2>/dev/null | grep -i ssh || ss -lntp 2>/dev/null || true
     echo -e "${WT}${B0}Эффективная конфигурация sshd (port):${R0}"
     sshd -T 2>/dev/null | awk '/^port /{print}' || true
-    journalctl -u "${unit}" -n 120 --no-pager || true
+    journalctl -u "${unit}" -n 160 --no-pager || true
     die "Порт не применился / sshd не слушает новый порт"
   fi
 }
@@ -253,6 +259,7 @@ EOF
 
   comment_out_other_port_directives "${dropin_file}"
 
+  ensure_run_sshd
   if ! sshd -t >/dev/null 2>&1; then
     stop_spinner_fail
     sshd -t || true
@@ -276,6 +283,7 @@ setup_fail2ban() {
   cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
+port = ${SSH_PORT}
 bantime = 30m
 findtime = 10m
 maxretry = 5
@@ -320,6 +328,10 @@ disable_netfilter_persistent() {
   ok "netfilter-persistent выключен"
 }
 
+detect_docker_bridge_ifaces() {
+  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^docker0$|^br-' || true
+}
+
 setup_nftables_firewall() {
   local ssh_port="$1"
   local control_ip="$2"
@@ -330,8 +342,20 @@ setup_nftables_firewall() {
   validate_ipv4 "$monitoring_ip" || die "Неверный IPv4 monitoring_sources: $monitoring_ip"
 
   apt_install nftables
-  start_spinner "Настройка nftables (/etc/nftables.conf)"
 
+  local ifaces
+  ifaces="$(detect_docker_bridge_ifaces)"
+  local forward_rules=""
+  if [[ -n "${ifaces}" ]]; then
+    while IFS= read -r iface; do
+      [[ -z "${iface}" ]] && continue
+      forward_rules+=$'        iifname "'"${iface}"$'" accept comment "Allow docker bridge traffic"\n'
+      forward_rules+=$'        oifname "'"${iface}"$'" tcp dport $WEB_PORTS ct state new accept comment "Allow new TCP to docker web ports"\n'
+      forward_rules+=$'        oifname "'"${iface}"$'" udp dport 443 ct state new accept comment "Allow new UDP/443 (QUIC) to docker"\n'
+    done <<< "${ifaces}"
+  fi
+
+  start_spinner "Настройка nftables (/etc/nftables.conf)"
   backup_file /etc/nftables.conf
 
   cat > /etc/nftables.conf <<EOF
@@ -408,7 +432,7 @@ table inet firewall {
     chain forward {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept comment "Allow established forward"
-        drop comment "Drop forward"
+${forward_rules}        drop comment "Drop forward"
     }
 
     chain output {
@@ -696,12 +720,15 @@ compose_down_up() {
 verify_everything() {
   start_spinner "Проверка: nftables / ssh / docker"
   systemctl is-active --quiet nftables || { stop_spinner_fail; die "nftables не активен"; }
+
   local eff_port
   eff_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
   [[ "${eff_port:-}" == "${SSH_PORT}" ]] || { stop_spinner_fail; die "sshd effective port=${eff_port:-?} не равен ${SSH_PORT}"; }
+
   ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${SSH_PORT}\b" || { stop_spinner_fail; die "порт ${SSH_PORT} не слушается"; }
-  nft list ruleset 2>/dev/null | grep -qE 'set user_blacklist' || { stop_spinner_fail; die "в ruleset не найден set user_blacklist"; }
+
   nft list ruleset 2>/dev/null | grep -qE 'table inet firewall' || { stop_spinner_fail; die "в ruleset не найден table inet firewall"; }
+  nft list ruleset 2>/dev/null | grep -qE 'set user_blacklist' || { stop_spinner_fail; die "в ruleset не найден set user_blacklist"; }
 
   (cd /opt/remnanode && docker compose ps >/dev/null 2>&1) || { stop_spinner_fail; die "docker compose ps не выполняется"; }
   docker ps --format '{{.Names}} {{.Status}}' | grep -q '^blocker-xray ' || { stop_spinner_fail; die "контейнер blocker-xray не найден"; }
@@ -731,28 +758,7 @@ show_status_and_logs() {
     echo -e "${CY}${B0}Онлайн логи vector (15s):${R0}"
     timeout 15s docker logs -f vector 2>/dev/null || true
     echo
-  else
-    echo -e "${YL}${B0}timeout не найден — пропускаю live-follow. Поставь coreutils если нужно.${R0}"
   fi
-}
-
-clone_or_update_repo() {
-  local dst="/opt/remnawave-observer"
-  local url="https://github.com/0FL01/remnawave-observer.git"
-
-  mkdir -p /opt
-  if [[ -d "${dst}/.git" ]]; then
-    start_spinner "Обновляю репозиторий в ${dst}"
-    git -C "${dst}" fetch --all --prune >/dev/null
-    git -C "${dst}" reset --hard origin/main >/dev/null 2>&1 || git -C "${dst}" reset --hard origin/master >/dev/null
-    stop_spinner_ok
-  else
-    start_spinner "Клонирую репозиторий в ${dst}"
-    rm -rf "${dst}"
-    git clone --depth 1 "${url}" "${dst}" >/dev/null
-    stop_spinner_ok
-  fi
-  ok "Репозиторий готов: ${dst}"
 }
 
 main() {
@@ -802,7 +808,7 @@ main() {
   ensure_remnanode_paths
 
   upsert_env_kv_with_blank_before "/opt/remnanode/.env" "RABBITMQ_URL" "${RABBITMQ_URL}"
-  ok "Обновлён /opt/remnanode/.env (перед RABBITMQ_URL вставлена пустая строка, если файл был не пустой)"
+  ok "Обновлён /opt/remnanode/.env"
 
   render_vector_toml_exact "${OBS_DOMAIN}"
 
