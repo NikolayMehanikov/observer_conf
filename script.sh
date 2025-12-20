@@ -18,9 +18,9 @@ SPIN_CHARS='|/-\'
 SPIN_PID=""
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
-ok() { echo -e "${GN}${B0}✔${R0} $*"; }
-info() { echo -e "${CY}${B0}➜${R0} $*"; }
-warn() { echo -e "${YL}${B0}⚠${R0} $*"; }
+ok()  { echo -e "${GN}${B0}✔${R0} $*"; }
+info(){ echo -e "${CY}${B0}➜${R0} $*"; }
+warn(){ echo -e "${YL}${B0}⚠${R0} $*"; }
 
 start_spinner() {
   local msg="$1"
@@ -61,10 +61,7 @@ on_err() {
 }
 trap on_err ERR
 
-require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"
-}
-
+require_root() { [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
 apt_install() {
@@ -73,6 +70,14 @@ apt_install() {
   DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
   DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null
   stop_spinner_ok
+}
+
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$f" "${f}.bak.${ts}"
 }
 
 read_nonempty() {
@@ -90,6 +95,20 @@ read_nonempty() {
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
   done
+  printf -v "${varname}" '%s' "${value}"
+}
+
+read_with_default() {
+  local prompt="$1"
+  local def="$2"
+  local varname="$3"
+  local value=""
+  read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}(Enter = ${def})${R0} ")" value || true
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ -z "$value" ]]; then
+    value="$def"
+  fi
   printf -v "${varname}" '%s' "${value}"
 }
 
@@ -111,6 +130,7 @@ validate_ipv4_one() {
 }
 
 normalize_ipv4_list_to_nft_elements() {
+  # Ввод: "1.1.1.1, 2.2.2.2;3.3.3.3" -> "1.1.1.1, 2.2.2.2, 3.3.3.3"
   local raw="$1"
   local cleaned
   cleaned="$(echo "$raw" | tr ',;' '  ' | tr -s ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -122,15 +142,13 @@ normalize_ipv4_list_to_nft_elements() {
     validate_ipv4_one "$ip" || die "Невалидный IPv4: $ip"
     out+=("$ip")
   done < <(echo "$cleaned" | tr ' ' '\n' | sed '/^$/d')
+
   [[ "${#out[@]}" -gt 0 ]] || die "IP список пустой"
+
   local joined=""
   local i=0
   for ip in "${out[@]}"; do
-    if (( i == 0 )); then
-      joined="$ip"
-    else
-      joined="$joined, $ip"
-    fi
+    if (( i == 0 )); then joined="$ip"; else joined="$joined, $ip"; fi
     i=$((i+1))
   done
   echo "$joined"
@@ -157,32 +175,18 @@ ensure_docker() {
   ok "Docker работает"
 }
 
-backup_file() {
-  local f="$1"
-  [[ -f "$f" ]] || return 0
-  local ts
-  ts="$(date +%Y%m%d-%H%M%S)"
-  cp -a "$f" "${f}.bak.${ts}"
+detect_ssh_unit() {
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  return 1
 }
 
-detect_ssh_unit() {
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
-    echo "ssh"
-    return 0
-  fi
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
-    echo "sshd"
-    return 0
-  fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
-    echo "ssh"
-    return 0
-  fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
-    echo "sshd"
-    return 0
-  fi
-  return 1
+ensure_run_sshd_dir() {
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+  chown root:root /run/sshd
 }
 
 ensure_sshd_include_dropins() {
@@ -199,10 +203,12 @@ ensure_sshd_include_dropins() {
 comment_out_other_port_directives() {
   local keep_file="$1"
   local main_cfg="/etc/ssh/sshd_config"
+
   if grep -Eiq '^\s*Port\s+[0-9]+' "$main_cfg"; then
     backup_file "$main_cfg"
     sed -i -E 's/^\s*(Port\s+[0-9]+)\s*$/# \1/Ig' "$main_cfg"
   fi
+
   shopt -s nullglob
   local f
   for f in /etc/ssh/sshd_config.d/*.conf; do
@@ -215,44 +221,32 @@ comment_out_other_port_directives() {
   shopt -u nullglob
 }
 
-ensure_run_sshd_dir() {
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-  chown root:root /run/sshd
-}
-
 restart_ssh_and_verify() {
   local unit="$1"
   local new_port="$2"
 
   systemctl daemon-reload >/dev/null 2>&1 || true
+  ensure_run_sshd_dir
+
+  # socket activation (если есть)
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
     systemctl restart ssh.socket >/dev/null 2>&1 || true
   fi
-
-  ensure_run_sshd_dir
 
   systemctl restart "${unit}" >/dev/null
 
   systemctl is-active --quiet "${unit}" || {
     echo -e "${RD}${B0}SSH unit не активен после рестарта.${R0}"
-    echo -e "${WT}${B0}Последние логи systemd (${unit}):${R0}"
-    journalctl -u "${unit}" -n 120 --no-pager || true
+    journalctl -u "${unit}" -n 160 --no-pager || true
     die "SSH не поднялся после применения конфига"
   }
 
-  if ! cmd_exists ss; then
-    apt_install iproute2
-  fi
-
+  if ! cmd_exists ss; then apt_install iproute2; fi
   if ! ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${new_port}\b"; then
     echo -e "${RD}${B0}sshd не слушает порт ${new_port}.${R0}"
-    echo -e "${WT}${B0}ss -lntp (ssh):${R0}"
     ss -lntp 2>/dev/null | grep -i ssh || ss -lntp 2>/dev/null || true
-    echo -e "${WT}${B0}Эффективная конфигурация sshd (ports):${R0}"
     sshd -T 2>/dev/null | awk '/^port /{print}' || true
-    echo -e "${WT}${B0}Последние логи systemd (${unit}):${R0}"
-    journalctl -u "${unit}" -n 160 --no-pager || true
+    journalctl -u "${unit}" -n 200 --no-pager || true
     die "Порт не применился / sshd не слушает новый порт"
   fi
 }
@@ -271,6 +265,7 @@ ssh_hardening_port() {
 
   backup_file "${dropin_file}"
   cat > "${dropin_file}" <<EOF
+# Managed by installer script
 Port ${new_port}
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -280,12 +275,11 @@ PrintMotd no
 Banner none
 EOF
 
-  rm -f /etc/issue /etc/issue.net
+  rm -f /etc/issue /etc/issue.net || true
   : > /etc/issue
   : > /etc/issue.net
 
   comment_out_other_port_directives "${dropin_file}"
-
   ensure_run_sshd_dir
 
   if ! sshd -t >/dev/null 2>&1; then
@@ -302,6 +296,12 @@ EOF
   stop_spinner_ok
   ok "SSH применён. Новый порт: ${new_port}"
   echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии: ${B0}ssh -p ${new_port} root@<IP>${R0}"
+}
+
+set_root_password() {
+  echo -e "${CY}${B0}ROOT пароль:${R0}"
+  passwd root
+  ok "Пароль root изменён"
 }
 
 setup_fail2ban() {
@@ -368,133 +368,219 @@ clone_or_update_repo() {
 
 apply_nftables_from_repo_example() {
   local ssh_port="$1"
-  local control_ips_csv="$2"
-  local monitoring_ips_csv="$3"
+  local control_port="$2"
+  local monitoring_port="$3"
+  local node_api_port="$4"
+  local control_ips_csv="$5"
+  local monitoring_ips_csv="$6"
 
   local src="/opt/remnawave-observer/nftables_example.conf"
   [[ -f "$src" ]] || die "Не найден ${src}"
 
-  local control_elems
-  local monitoring_elems
+  local control_elems monitoring_elems
   control_elems="$(normalize_ipv4_list_to_nft_elements "$control_ips_csv")"
   monitoring_elems="$(normalize_ipv4_list_to_nft_elements "$monitoring_ips_csv")"
 
-  start_spinner "Готовлю /etc/nftables.conf из nftables_example.conf"
-
+  start_spinner "Готовлю /etc/nftables.conf из repo nftables_example.conf"
   backup_file /etc/nftables.conf
 
-  python3 - "$src" "$ssh_port" "$control_elems" "$monitoring_elems" <<'PY'
+  python3 - "$src" "$ssh_port" "$control_port" "$monitoring_port" "$node_api_port" "$control_elems" "$monitoring_elems" > /etc/nftables.conf <<'PY'
 import sys, re
 
 src = sys.argv[1]
-ssh_port = sys.argv[2]
-control = sys.argv[3]
-monitoring = sys.argv[4]
+SSH_PORT = sys.argv[2]
+CONTROL_PORT = sys.argv[3]
+MONITORING_PORT = sys.argv[4]
+NODE_API_PORT = sys.argv[5]
+CONTROL_ELEMS = sys.argv[6]
+MONITOR_ELEMS = sys.argv[7]
 
 with open(src, "r", encoding="utf-8") as f:
     lines = f.readlines()
 
+# --- helpers ---
+def replace_define(line: str, name: str, value: str) -> str:
+    # define NAME = 123
+    pattern = re.compile(rf'^(\s*define\s+{re.escape(name)}\s*=\s*)\d+(\s*)$', re.IGNORECASE)
+    m = pattern.match(line.rstrip("\n"))
+    if not m:
+        return line
+    return f"{m.group(1)}{value}{m.group(2)}\n"
+
+def is_forward_drop(line: str) -> bool:
+    return re.match(r'^\s*drop\s+comment\s+"Drop forward"\s*;?\s*$', line.strip()) is not None
+
 out = []
-in_control = False
-in_monitor = False
+in_control_set = False
+in_monitor_set = False
 
-re_define_ssh = re.compile(r'^\s*define\s+SSH_PORT\s*=\s*\d+\s*$')
-re_set_control = re.compile(r'^\s*set\s+control_plane_sources\s*\{')
-re_set_monitor = re.compile(r'^\s*set\s+monitoring_sources\s*\{')
-re_elements = re.compile(r'^(\s*elements\s*=\s*\{\s*)(.*?)(\s*\}\s*;?\s*)$')
+in_chain_forward = False
+forward_depth = 0
+forward_has_docker0_iif = False
+forward_has_docker0_oif = False
+forward_has_br_iif = False
+forward_has_br_oif = False
 
-for line in lines:
-    if re_define_ssh.match(line.strip()):
-        out.append(re.sub(r'\d+', ssh_port, line))
+in_chain_input = False
+input_depth = 0
+has_node_api_rule = False
+
+# First pass: detect if template has NODE_API define already
+has_define_node_api = any(re.match(r'^\s*define\s+NODE_API_PORT\s*=\s*\d+', ln.strip(), re.IGNORECASE) for ln in lines)
+
+# For insertion positions
+inserted_define_node_api = False
+
+for idx, line in enumerate(lines):
+    # Replace common defines if present
+    line2 = line
+    line2 = replace_define(line2, "SSH_PORT", SSH_PORT)
+    line2 = replace_define(line2, "CONTROL_PORT", CONTROL_PORT)
+    line2 = replace_define(line2, "MONITORING_PORT", MONITORING_PORT)
+
+    # If NODE_API define exists in template, replace it too
+    if has_define_node_api:
+        line2 = replace_define(line2, "NODE_API_PORT", NODE_API_PORT)
+
+    # If template doesn't have NODE_API define, insert it after MONITORING_PORT define if we see it,
+    # otherwise after CONTROL_PORT or SSH_PORT define (first matched).
+    if not has_define_node_api and not inserted_define_node_api:
+        if re.match(r'^\s*define\s+MONITORING_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
+            out.append(line2)
+            out.append(f"define NODE_API_PORT = {NODE_API_PORT}\n")
+            inserted_define_node_api = True
+            continue
+        if re.match(r'^\s*define\s+CONTROL_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
+            # не вставляем тут, только запоминаем — лучше после MONITORING_PORT, но если её нет — вставим позже
+            pass
+        if re.match(r'^\s*define\s+SSH_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
+            # тоже не вставляем сразу
+            pass
+
+    # Detect sets blocks for IP replacement
+    if re.match(r'^\s*set\s+control_plane_sources\s*\{', line2):
+        in_control_set = True
+        in_monitor_set = False
+        out.append(line2)
+        continue
+    if re.match(r'^\s*set\s+monitoring_sources\s*\{', line2):
+        in_monitor_set = True
+        in_control_set = False
+        out.append(line2)
         continue
 
-    if re_set_control.search(line):
-        in_control = True
-        in_monitor = False
-        out.append(line)
+    m_elems = re.match(r'^(\s*elements\s*=\s*\{\s*)(.*?)(\s*\}\s*;?\s*)$', line2.rstrip("\n"))
+    if m_elems and in_control_set:
+        out.append(f"{m_elems.group(1)}{CONTROL_ELEMS}{m_elems.group(3)}\n")
+        continue
+    if m_elems and in_monitor_set:
+        out.append(f"{m_elems.group(1)}{MONITOR_ELEMS}{m_elems.group(3)}\n")
         continue
 
-    if re_set_monitor.search(line):
-        in_monitor = True
-        in_control = False
-        out.append(line)
+    # End of set blocks
+    if in_control_set and line2.strip().startswith("}"):
+        in_control_set = False
+    if in_monitor_set and line2.strip().startswith("}"):
+        in_monitor_set = False
+
+    # Forward chain logic
+    if re.match(r'^\s*chain\s+forward\s*\{', line2):
+        in_chain_forward = True
+        forward_depth = 1
+        out.append(line2)
         continue
 
-    m = re_elements.match(line)
-    if m and in_control:
-        out.append(m.group(1) + control + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+    if in_chain_forward:
+        # track depth
+        forward_depth += line2.count("{")
+        forward_depth -= line2.count("}")
+
+        if 'iifname "docker0"' in line2:
+            forward_has_docker0_iif = True
+        if 'oifname "docker0"' in line2:
+            forward_has_docker0_oif = True
+        if 'iifname "br-"' in line2 or 'iifname "br-*" ' in line2 or 'iifname "br-*"'.strip() in line2:
+            forward_has_br_iif = True
+        if 'oifname "br-"' in line2 or 'oifname "br-*" ' in line2 or 'oifname "br-*"'.strip() in line2:
+            forward_has_br_oif = True
+
+        # REMOVE dangerous unconditional drop in forward chain, if present
+        if is_forward_drop(line2):
+            continue
+
+        # Before closing brace of forward chain (depth will become 0 after this line if it contains '}')
+        if line2.strip() == "}" and forward_depth == 0:
+            # Insert safe docker forward accepts (only if not already present)
+            if not forward_has_docker0_iif:
+                out.append('        iifname "docker0" accept comment "Allow docker0 forward in"\n')
+            if not forward_has_docker0_oif:
+                out.append('        oifname "docker0" accept comment "Allow docker0 forward out"\n')
+            # Bridge interfaces (compose networks) — wildcard via sets is not available in pure nft, but br-* is used often in docs.
+            # Use meta iifname/oifname with prefix match through regex (nft supports regex for iifname in some builds; if not, user still has docker0)
+            # We'll use explicit common pattern br-*
+            if not forward_has_br_iif:
+                out.append('        iifname "br-*" accept comment "Allow docker bridge forward in"\n')
+            if not forward_has_br_oif:
+                out.append('        oifname "br-*" accept comment "Allow docker bridge forward out"\n')
+            out.append(line2)
+            in_chain_forward = False
+            continue
+
+        out.append(line2)
         continue
 
-    if m and in_monitor:
-        out.append(m.group(1) + monitoring + m.group(3) + ("\n" if not line.endswith("\n") else ""))
+    # Input chain logic (for NODE_API allow)
+    if re.match(r'^\s*chain\s+filter_input\s*\{', line2):
+        in_chain_input = True
+        input_depth = 1
+        out.append(line2)
         continue
 
-    if in_control and line.strip().startswith("}"):
-        in_control = False
-    if in_monitor and line.strip().startswith("}"):
-        in_monitor = False
+    if in_chain_input:
+        input_depth += line2.count("{")
+        input_depth -= line2.count("}")
 
-    out.append(line)
+        # detect existing node api rule
+        if re.search(r'\bRemnawave\b.*\bnode\b.*\bAPI\b', line2, re.IGNORECASE) or re.search(r'\bNODE_API_PORT\b', line2):
+            has_node_api_rule = True
+
+        # insert allow right after control plane allow, if node api allow absent
+        if (not has_node_api_rule) and re.search(r'@control_plane_sources', line2) and re.search(r'\bdport\b', line2):
+            out.append(line2)
+            # Use define if exists/inserted, else direct number
+            if has_define_node_api or inserted_define_node_api:
+                out.append('        ip saddr @control_plane_sources tcp dport $NODE_API_PORT ct state new accept comment "Remnawave node API"\n')
+            else:
+                out.append(f'        ip saddr @control_plane_sources tcp dport {NODE_API_PORT} ct state new accept comment "Remnawave node API"\n')
+            has_node_api_rule = True
+            continue
+
+        # end of chain
+        if line2.strip() == "}" and input_depth == 0:
+            out.append(line2)
+            in_chain_input = False
+            continue
+
+        out.append(line2)
+        continue
+
+    out.append(line2)
+
+# If MONITORING_PORT define wasn't present and we didn't insert NODE_API define yet, insert near top (after SSH_PORT define if any)
+if (not has_define_node_api) and (not inserted_define_node_api):
+    new_out = []
+    inserted = False
+    for ln in out:
+        new_out.append(ln)
+        if (not inserted) and re.match(r'^\s*define\s+SSH_PORT\s*=\s*\d+', ln.strip(), re.IGNORECASE):
+            new_out.append(f"define NODE_API_PORT = {NODE_API_PORT}\n")
+            inserted = True
+    out = new_out
 
 sys.stdout.write("".join(out))
 PY
-  stop_spinner_ok > /tmp/.nft_gen.log 2>/dev/null || true
 
-  python3 - "$src" "$ssh_port" "$control_elems" "$monitoring_elems" > /etc/nftables.conf <<'PY'
-import sys, re
-
-src = sys.argv[1]
-ssh_port = sys.argv[2]
-control = sys.argv[3]
-monitoring = sys.argv[4]
-
-with open(src, "r", encoding="utf-8") as f:
-    lines = f.readlines()
-
-out = []
-in_control = False
-in_monitor = False
-
-re_define_ssh = re.compile(r'^\s*define\s+SSH_PORT\s*=\s*\d+\s*$')
-re_set_control = re.compile(r'^\s*set\s+control_plane_sources\s*\{')
-re_set_monitor = re.compile(r'^\s*set\s+monitoring_sources\s*\{')
-re_elements = re.compile(r'^(\s*elements\s*=\s*\{\s*)(.*?)(\s*\}\s*;?\s*)$')
-
-for line in lines:
-    if re_define_ssh.match(line.strip()):
-        out.append(re.sub(r'\d+', ssh_port, line))
-        continue
-
-    if re_set_control.search(line):
-        in_control = True
-        in_monitor = False
-        out.append(line)
-        continue
-
-    if re_set_monitor.search(line):
-        in_monitor = True
-        in_control = False
-        out.append(line)
-        continue
-
-    m = re_elements.match(line)
-    if m and in_control:
-        out.append(m.group(1) + control + m.group(3) + ("\n" if not line.endswith("\n") else ""))
-        continue
-
-    if m and in_monitor:
-        out.append(m.group(1) + monitoring + m.group(3) + ("\n" if not line.endswith("\n") else ""))
-        continue
-
-    if in_control and line.strip().startswith("}"):
-        in_control = False
-    if in_monitor and line.strip().startswith("}"):
-        in_monitor = False
-
-    out.append(line)
-
-sys.stdout.write("".join(out))
-PY
+  stop_spinner_ok
 
   start_spinner "Проверка синтаксиса nftables"
   nft -c -f /etc/nftables.conf >/dev/null
@@ -506,13 +592,7 @@ PY
   systemctl restart nftables >/dev/null 2>&1 || true
   stop_spinner_ok
 
-  ok "nftables применён из репозитория (структура сохранена), подставлены IP и SSH_PORT"
-}
-
-set_root_password() {
-  echo -e "${CY}${B0}ROOT пароль:${R0}"
-  passwd root
-  ok "Пароль root изменён"
+  ok "nftables применён (repo-first). Разрешён NODE_API_PORT (${node_api_port}) только от control_plane_sources."
 }
 
 ensure_remnanode_paths() {
@@ -541,10 +621,7 @@ upsert_env_kv_with_blank_before() {
   if [[ -s "$file" ]]; then
     last_line="$(tail -n 1 "$file" || true)"
   fi
-
-  if [[ -n "$last_line" ]]; then
-    printf "\n" >> "$file"
-  fi
+  if [[ -n "$last_line" ]]; then printf "\n" >> "$file"; fi
   printf "%s=%s\n" "$key" "$val" >> "$file"
 }
 
@@ -554,42 +631,24 @@ render_vector_toml_exact() {
   local uri="https://${domain}:38213/"
 
   cat > "${out}" <<EOF
-# Источник данных: указываем, откуда читать логи.
-# Мы будем читать access.log из директории, которую пробросим из remnanode.
 [sources.xray_access_logs]
   type = "file"
-  # ВАЖНО: Путь внутри контейнера Vector. Мы пробросим /var/log/remnanode с хоста.
   include = ["/var/log/remnanode/access.log"]
-  # Начинаем читать с конца файла, чтобы не обрабатывать старые записи при перезапуске
   read_from = "end"
 
-# Трансформация: парсим каждую строку лога, чтобы извлечь нужные данные.
 [transforms.parse_xray_log]
   type = "remap"
   inputs = ["xray_access_logs"]
   source = '''
-    # (tcp:)? означает, что группа "tcp:" может присутствовать 0 или 1 раз.
     pattern = r'from (tcp:)?(?P<ip>\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}):\\d+.*? email: (?P<email>\\S+)'
-
     parsed, err = parse_regex(.message, pattern)
-
-    if err != null {
-      log("Не удалось распарсить строку лога: " + err, level: "warn")
-      abort
-    }
-
-    . = {
-      "user_email": parsed.email,
-      "source_ip": parsed.ip,
-      "timestamp": to_string(now())
-    }
+    if err != null { log("Parse failed: " + err, level: "warn"); abort }
+    . = { "user_email": parsed.email, "source_ip": parsed.ip, "timestamp": to_string(now()) }
   '''
 
-# Назначение: отправляем обработанные данные на наш центральный сервис-наблюдатель.
 [sinks.central_observer_api]
   type = "http"
   inputs = ["parse_xray_log"]
-  # ВАЖНО: Указываем HTTPS и ваш домен!
   uri = "${uri}"
   method = "post"
   encoding.codec = "json"
@@ -638,19 +697,11 @@ blocker = {
   "image": "quay.io/0fl01/blocker-xray-go:0.0.6",
   "restart": "unless-stopped",
   "network_mode": "host",
-  "logging": {
-    "driver": "json-file",
-    "options": {"max-size":"8m","max-file":"5"}
-  },
+  "logging": {"driver":"json-file","options":{"max-size":"8m","max-file":"5"}},
   "env_file": [".env"],
   "cap_add": ["NET_ADMIN","NET_RAW"],
   "depends_on": ["remnanode"],
-  "deploy": {
-    "resources": {
-      "limits": {"memory":"64M","cpus":"0.25"},
-      "reservations": {"memory":"32M","cpus":"0.10"}
-    }
-  }
+  "deploy": {"resources":{"limits":{"memory":"64M","cpus":"0.25"},"reservations":{"memory":"32M","cpus":"0.10"}}}
 }
 
 vector = {
@@ -661,20 +712,9 @@ vector = {
   "network_mode": "host",
   "command": ["--config", "/etc/vector/vector.toml"],
   "depends_on": ["remnanode"],
-  "volumes": [
-    "./vector.toml:/etc/vector/vector.toml:ro",
-    "/var/log/remnanode:/var/log/remnanode:ro"
-  ],
-  "logging": {
-    "driver": "json-file",
-    "options": {"max-size":"8m","max-file":"3"}
-  },
-  "deploy": {
-    "resources": {
-      "limits": {"memory":"128M","cpus":"0.25"},
-      "reservations": {"memory":"64M","cpus":"0.10"}
-    }
-  }
+  "volumes": ["./vector.toml:/etc/vector/vector.toml:ro","/var/log/remnanode:/var/log/remnanode:ro"],
+  "logging": {"driver":"json-file","options":{"max-size":"8m","max-file":"3"}},
+  "deploy": {"resources":{"limits":{"memory":"128M","cpus":"0.25"},"reservations":{"memory":"64M","cpus":"0.10"}}}
 }
 
 changed = False
@@ -689,53 +729,62 @@ if not changed:
 
 tmp = compose_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
-    yaml.safe_dump(
-        data, f,
-        default_flow_style=False,
-        sort_keys=False,
-        allow_unicode=True
-    )
+    yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 os.replace(tmp, compose_path)
 print("CHANGED")
 PY
 }
 
-compose_down_up() {
-  start_spinner "docker compose down"
-  (cd /opt/remnanode && docker compose down --remove-orphans) >/dev/null 2>&1 || true
-  stop_spinner_ok
-
-  start_spinner "docker compose up -d"
-  (cd /opt/remnanode && docker compose up -d) >/dev/null
-  stop_spinner_ok
+compose_apply_safely() {
+  local changed="$1"
+  if [[ "${changed}" == "CHANGED" ]]; then
+    start_spinner "docker compose down (только потому что compose изменён)"
+    (cd /opt/remnanode && docker compose down --remove-orphans) >/dev/null 2>&1 || true
+    stop_spinner_ok
+    start_spinner "docker compose up -d"
+    (cd /opt/remnanode && docker compose up -d) >/dev/null
+    stop_spinner_ok
+  else
+    start_spinner "docker compose up -d (без down)"
+    (cd /opt/remnanode && docker compose up -d) >/dev/null
+    stop_spinner_ok
+  fi
 }
 
 show_logs_and_status() {
   echo -e "${WT}${B0}docker compose ps:${R0}"
   (cd /opt/remnanode && docker compose ps) || true
   echo
-  echo -e "${WT}${B0}Логи blocker-xray (tail 160):${R0}"
-  docker logs --tail 160 blocker-xray 2>/dev/null || true
+  echo -e "${WT}${B0}Логи blocker-xray (tail 200):${R0}"
+  docker logs --tail 200 blocker-xray 2>/dev/null || true
   echo
-  echo -e "${WT}${B0}Логи vector (tail 160):${R0}"
-  docker logs --tail 160 vector 2>/dev/null || true
+  echo -e "${WT}${B0}Логи vector (tail 200):${R0}"
+  docker logs --tail 200 vector 2>/dev/null || true
 }
 
 main() {
   require_root
-
   clear || true
-  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (repo-first) ===${R0}"
+  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (repo-first + safe nftables) ===${R0}"
   echo
 
-  apt_install ca-certificates curl iproute2 openssh-server coreutils nftables
+  apt_install ca-certificates curl iproute2 openssh-server coreutils nftables netcat-openbsd
   ensure_git_python_yaml
   ensure_docker
 
   read_nonempty "Новый SSH порт (например 50012):" SSH_PORT 0
-  validate_port "${SSH_PORT}" || die "Порт невалидный"
+  validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
 
-  read_nonempty "IPv4 адрес главного сервера (Control plane, для nftables) (можно несколько через запятую):" CONTROL_IPS 0
+  read_with_default "CONTROL_PORT (порт control-plane/админки по доке):" "4431" CONTROL_PORT
+  validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
+
+  read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
+  validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
+
+  read_with_default "NODE_API_PORT (порт API ноды Remnawave, обычно 2041):" "2041" NODE_API_PORT
+  validate_port "${NODE_API_PORT}" || die "NODE_API_PORT невалидный"
+
+  read_nonempty "IPv4 адрес главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
   read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
 
   echo
@@ -746,7 +795,14 @@ main() {
   ssh_hardening_port "${SSH_PORT}"
 
   clone_or_update_repo
-  apply_nftables_from_repo_example "${SSH_PORT}" "${CONTROL_IPS}" "${MONITOR_IPS}"
+
+  apply_nftables_from_repo_example \
+    "${SSH_PORT}" \
+    "${CONTROL_PORT}" \
+    "${MONITORING_PORT}" \
+    "${NODE_API_PORT}" \
+    "${CONTROL_IPS}" \
+    "${MONITOR_IPS}"
 
   setup_fail2ban
   setup_sysctl
@@ -766,12 +822,12 @@ main() {
   ensure_remnanode_paths
 
   upsert_env_kv_with_blank_before "/opt/remnanode/.env" "RABBITMQ_URL" "${RABBITMQ_URL}"
-  ok "Обновлён /opt/remnanode/.env (RABBITMQ_URL добавлен с пустой строкой перед ним, если файл не пустой)"
+  ok "Обновлён /opt/remnanode/.env (RABBITMQ_URL)"
 
   render_vector_toml_exact "${OBS_DOMAIN}"
 
   start_spinner "Правлю /opt/remnanode/docker-compose.yml (blocker-xray + vector)"
-  out="$(patch_compose_add_services || true)"
+  out="$(patch_compose_add_services)"
   stop_spinner_ok
   if [[ "${out:-}" == "NOCHANGE" ]]; then
     ok "docker-compose.yml уже содержит blocker-xray/vector"
@@ -779,14 +835,30 @@ main() {
     ok "docker-compose.yml обновлён"
   fi
 
-  compose_down_up
+  compose_apply_safely "${out:-NOCHANGE}"
 
   echo
   ok "Готово"
   echo
-  show_logs_and_status
+
+  # Быстрая самопроверка портов
+  echo -e "${WT}${B0}Порты на хосте:${R0}"
+  ss -lntp | grep -E ":${SSH_PORT}\b|:${NODE_API_PORT}\b|:80\b|:443\b|:${MONITORING_PORT}\b" || true
   echo
-  echo -e "${YL}${B0}Проверь вход в новой сессии SSH:${R0} ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
+
+  echo -e "${WT}${B0}Проверка доступа к RabbitMQ:${R0}"
+  # (Это проверка "с ноды до панели", inbound на панели — не наша зона)
+  host="$(echo "$RABBITMQ_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+).*$#\2#')"
+  port="$(echo "$RABBITMQ_URL" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+):([0-9]+).*$#\3#p')"
+  [[ -n "${port:-}" ]] || port="38214"
+  nc -vz -w2 "$host" "$port" || true
+  echo
+
+  show_logs_and_status
+
+  echo
+  echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
+  echo -e "${YL}${B0}ВАЖНО:${R0} nftables теперь разрешает NODE_API_PORT=${NODE_API_PORT} только от CONTROL_IPS (${CONTROL_IPS})."
 }
 
 main "$@"
