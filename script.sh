@@ -19,7 +19,6 @@ SPIN_PID=""
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
 ok() { echo -e "${GN}${B0}✔${R0} $*"; }
-info() { echo -e "${CY}${B0}➜${R0} $*"; }
 warn() { echo -e "${YL}${B0}⚠${R0} $*"; }
 
 start_spinner() {
@@ -141,9 +140,7 @@ ensure_docker() {
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
 
-  if ! docker info >/dev/null 2>&1; then
-    die "Docker не запускается. Проверь: systemctl status docker"
-  fi
+  docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
 
   if ! docker compose version >/dev/null 2>&1; then
     apt_install docker-compose-plugin
@@ -153,18 +150,10 @@ ensure_docker() {
 }
 
 detect_ssh_unit() {
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
-    echo "ssh"; return 0
-  fi
-  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
-    echo "sshd"; return 0
-  fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then
-    echo "ssh"; return 0
-  fi
-  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then
-    echo "sshd"; return 0
-  fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
   return 1
 }
 
@@ -501,7 +490,7 @@ clone_or_update_repo() {
 }
 
 ensure_remnanode_paths() {
-  [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode (должен существовать с твоим remnanode docker-compose.yml)"
+  [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode"
   [[ -f /opt/remnanode/docker-compose.yml ]] || die "Не найден /opt/remnanode/docker-compose.yml"
 
   mkdir -p /var/log/remnanode
@@ -518,7 +507,7 @@ upsert_env_kv_with_blank_before() {
   touch "$file"
 
   python3 - <<PY
-import os, re
+import os
 path = "${file}"
 key = "${key}"
 val = "${val}"
@@ -526,19 +515,13 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
     lines = f.read().splitlines()
 
 out = []
-found = False
 for line in lines:
     if line.startswith(key + "="):
         continue
     out.append(line)
 
-need_blank = False
 if out and out[-1].strip() != "":
-    need_blank = True
-
-if need_blank:
     out.append("")
-
 out.append(f"{key}={val}")
 
 tmp = path + ".tmp"
@@ -710,15 +693,66 @@ compose_down_up() {
   stop_spinner_ok
 }
 
-show_status() {
-  echo -e "${WT}${B0}Состояние контейнеров:${R0}"
+verify_everything() {
+  start_spinner "Проверка: nftables / ssh / docker"
+  systemctl is-active --quiet nftables || { stop_spinner_fail; die "nftables не активен"; }
+  local eff_port
+  eff_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
+  [[ "${eff_port:-}" == "${SSH_PORT}" ]] || { stop_spinner_fail; die "sshd effective port=${eff_port:-?} не равен ${SSH_PORT}"; }
+  ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${SSH_PORT}\b" || { stop_spinner_fail; die "порт ${SSH_PORT} не слушается"; }
+  nft list ruleset 2>/dev/null | grep -qE 'set user_blacklist' || { stop_spinner_fail; die "в ruleset не найден set user_blacklist"; }
+  nft list ruleset 2>/dev/null | grep -qE 'table inet firewall' || { stop_spinner_fail; die "в ruleset не найден table inet firewall"; }
+
+  (cd /opt/remnanode && docker compose ps >/dev/null 2>&1) || { stop_spinner_fail; die "docker compose ps не выполняется"; }
+  docker ps --format '{{.Names}} {{.Status}}' | grep -q '^blocker-xray ' || { stop_spinner_fail; die "контейнер blocker-xray не найден"; }
+  docker ps --format '{{.Names}} {{.Status}}' | grep -q '^vector ' || { stop_spinner_fail; die "контейнер vector не найден"; }
+
+  stop_spinner_ok
+  ok "Проверки прошли"
+}
+
+show_status_and_logs() {
+  echo -e "${WT}${B0}Состояние docker compose:${R0}"
   (cd /opt/remnanode && docker compose ps) || true
   echo
-  echo -e "${WT}${B0}Логи blocker-xray (последние 120 строк):${R0}"
-  docker logs --tail 120 blocker-xray 2>/dev/null || true
+
+  echo -e "${WT}${B0}Последние логи blocker-xray (200 строк):${R0}"
+  docker logs --tail 200 blocker-xray 2>/dev/null || true
   echo
-  echo -e "${WT}${B0}Логи vector (последние 120 строк):${R0}"
-  docker logs --tail 120 vector 2>/dev/null || true
+
+  echo -e "${WT}${B0}Последние логи vector (200 строк):${R0}"
+  docker logs --tail 200 vector 2>/dev/null || true
+  echo
+
+  if cmd_exists timeout; then
+    echo -e "${CY}${B0}Онлайн логи blocker-xray (15s):${R0}"
+    timeout 15s docker logs -f blocker-xray 2>/dev/null || true
+    echo
+    echo -e "${CY}${B0}Онлайн логи vector (15s):${R0}"
+    timeout 15s docker logs -f vector 2>/dev/null || true
+    echo
+  else
+    echo -e "${YL}${B0}timeout не найден — пропускаю live-follow. Поставь coreutils если нужно.${R0}"
+  fi
+}
+
+clone_or_update_repo() {
+  local dst="/opt/remnawave-observer"
+  local url="https://github.com/0FL01/remnawave-observer.git"
+
+  mkdir -p /opt
+  if [[ -d "${dst}/.git" ]]; then
+    start_spinner "Обновляю репозиторий в ${dst}"
+    git -C "${dst}" fetch --all --prune >/dev/null
+    git -C "${dst}" reset --hard origin/main >/dev/null 2>&1 || git -C "${dst}" reset --hard origin/master >/dev/null
+    stop_spinner_ok
+  else
+    start_spinner "Клонирую репозиторий в ${dst}"
+    rm -rf "${dst}"
+    git clone --depth 1 "${url}" "${dst}" >/dev/null
+    stop_spinner_ok
+  fi
+  ok "Репозиторий готов: ${dst}"
 }
 
 main() {
@@ -728,13 +762,11 @@ main() {
   echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (nftables) ===${R0}"
   echo
 
-  if ! cmd_exists apt-get; then
-    die "Нужен Debian/Ubuntu (apt-get не найден)."
-  fi
+  cmd_exists apt-get || die "Нужен Debian/Ubuntu (apt-get не найден)."
 
   ensure_git_python_yaml
   ensure_docker
-  apt_install ca-certificates curl iproute2 openssh-server
+  apt_install ca-certificates curl iproute2 openssh-server coreutils
 
   read_nonempty "Новый SSH порт (например 50012):" SSH_PORT 0
   validate_port "${SSH_PORT}" || die "Порт невалидный"
@@ -784,14 +816,14 @@ main() {
   fi
 
   compose_down_up
+  verify_everything
 
   echo
   ok "Готово"
   echo
-  show_status
+  show_status_and_logs
   echo
-  echo -e "${YL}${B0}Проверь:${R0} в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
-  echo -e "${YL}${B0}Проверка nftables:${R0} ${B0}nft list ruleset | sed -n '1,120p'${R0}"
+  echo -e "${YL}${B0}Проверь вход в новой SSH-сессии:${R0} ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
 }
 
 main "$@"
