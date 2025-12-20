@@ -467,7 +467,7 @@ main() {
   echo -e "${MG}${B0}=== Установка Blocker + Vector ===${R0}"
   echo
 
-  read_nonempty "Домен центрального Observer (пример: obs.noctacore.com):" OBS_DOMAIN 0
+  read_nonempty "Домен центрального Observer (пример: obsexp.core.com):" OBS_DOMAIN 0
   OBS_DOMAIN="$(normalize_domain "${OBS_DOMAIN}")"
 
   read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:38214/):" RABBITMQ_URL 0
