@@ -304,49 +304,6 @@ set_root_password() {
   ok "Пароль root изменён"
 }
 
-setup_fail2ban() {
-  apt_install fail2ban
-  start_spinner "Настройка Fail2Ban"
-  mkdir -p /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
-enabled = true
-bantime = 30m
-findtime = 10m
-maxretry = 5
-backend = systemd
-EOF
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  systemctl restart fail2ban >/dev/null 2>&1 || true
-  stop_spinner_ok
-  ok "Fail2Ban активирован"
-}
-
-setup_sysctl() {
-  start_spinner "Применение sysctl"
-  cat > /etc/sysctl.d/99-hardening.conf <<EOF
-net.ipv4.icmp_echo_ignore_all = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  stop_spinner_ok
-  ok "sysctl применён"
-}
-
-disable_ufw() {
-  start_spinner "Отключение UFW"
-  systemctl stop ufw >/dev/null 2>&1 || true
-  systemctl disable ufw >/dev/null 2>&1 || true
-  stop_spinner_ok
-  ok "UFW выключен"
-}
-
 clone_or_update_repo() {
   local dst="/opt/remnawave-observer"
   local url="https://github.com/0FL01/remnawave-observer.git"
@@ -398,9 +355,7 @@ MONITOR_ELEMS = sys.argv[7]
 with open(src, "r", encoding="utf-8") as f:
     lines = f.readlines()
 
-# --- helpers ---
 def replace_define(line: str, name: str, value: str) -> str:
-    # define NAME = 123
     pattern = re.compile(rf'^(\s*define\s+{re.escape(name)}\s*=\s*)\d+(\s*)$', re.IGNORECASE)
     m = pattern.match(line.rstrip("\n"))
     if not m:
@@ -425,39 +380,25 @@ in_chain_input = False
 input_depth = 0
 has_node_api_rule = False
 
-# First pass: detect if template has NODE_API define already
 has_define_node_api = any(re.match(r'^\s*define\s+NODE_API_PORT\s*=\s*\d+', ln.strip(), re.IGNORECASE) for ln in lines)
-
-# For insertion positions
 inserted_define_node_api = False
 
 for idx, line in enumerate(lines):
-    # Replace common defines if present
     line2 = line
     line2 = replace_define(line2, "SSH_PORT", SSH_PORT)
     line2 = replace_define(line2, "CONTROL_PORT", CONTROL_PORT)
     line2 = replace_define(line2, "MONITORING_PORT", MONITORING_PORT)
 
-    # If NODE_API define exists in template, replace it too
     if has_define_node_api:
         line2 = replace_define(line2, "NODE_API_PORT", NODE_API_PORT)
 
-    # If template doesn't have NODE_API define, insert it after MONITORING_PORT define if we see it,
-    # otherwise after CONTROL_PORT or SSH_PORT define (first matched).
     if not has_define_node_api and not inserted_define_node_api:
         if re.match(r'^\s*define\s+MONITORING_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
             out.append(line2)
             out.append(f"define NODE_API_PORT = {NODE_API_PORT}\n")
             inserted_define_node_api = True
             continue
-        if re.match(r'^\s*define\s+CONTROL_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
-            # не вставляем тут, только запоминаем — лучше после MONITORING_PORT, но если её нет — вставим позже
-            pass
-        if re.match(r'^\s*define\s+SSH_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
-            # тоже не вставляем сразу
-            pass
 
-    # Detect sets blocks for IP replacement
     if re.match(r'^\s*set\s+control_plane_sources\s*\{', line2):
         in_control_set = True
         in_monitor_set = False
@@ -477,13 +418,11 @@ for idx, line in enumerate(lines):
         out.append(f"{m_elems.group(1)}{MONITOR_ELEMS}{m_elems.group(3)}\n")
         continue
 
-    # End of set blocks
     if in_control_set and line2.strip().startswith("}"):
         in_control_set = False
     if in_monitor_set and line2.strip().startswith("}"):
         in_monitor_set = False
 
-    # Forward chain logic
     if re.match(r'^\s*chain\s+forward\s*\{', line2):
         in_chain_forward = True
         forward_depth = 1
@@ -491,7 +430,6 @@ for idx, line in enumerate(lines):
         continue
 
     if in_chain_forward:
-        # track depth
         forward_depth += line2.count("{")
         forward_depth -= line2.count("}")
 
@@ -504,20 +442,14 @@ for idx, line in enumerate(lines):
         if 'oifname "br-"' in line2 or 'oifname "br-*" ' in line2 or 'oifname "br-*"'.strip() in line2:
             forward_has_br_oif = True
 
-        # REMOVE dangerous unconditional drop in forward chain, if present
         if is_forward_drop(line2):
             continue
 
-        # Before closing brace of forward chain (depth will become 0 after this line if it contains '}')
         if line2.strip() == "}" and forward_depth == 0:
-            # Insert safe docker forward accepts (only if not already present)
             if not forward_has_docker0_iif:
                 out.append('        iifname "docker0" accept comment "Allow docker0 forward in"\n')
             if not forward_has_docker0_oif:
                 out.append('        oifname "docker0" accept comment "Allow docker0 forward out"\n')
-            # Bridge interfaces (compose networks) — wildcard via sets is not available in pure nft, but br-* is used often in docs.
-            # Use meta iifname/oifname with prefix match through regex (nft supports regex for iifname in some builds; if not, user still has docker0)
-            # We'll use explicit common pattern br-*
             if not forward_has_br_iif:
                 out.append('        iifname "br-*" accept comment "Allow docker bridge forward in"\n')
             if not forward_has_br_oif:
@@ -529,7 +461,6 @@ for idx, line in enumerate(lines):
         out.append(line2)
         continue
 
-    # Input chain logic (for NODE_API allow)
     if re.match(r'^\s*chain\s+filter_input\s*\{', line2):
         in_chain_input = True
         input_depth = 1
@@ -540,14 +471,11 @@ for idx, line in enumerate(lines):
         input_depth += line2.count("{")
         input_depth -= line2.count("}")
 
-        # detect existing node api rule
         if re.search(r'\bRemnawave\b.*\bnode\b.*\bAPI\b', line2, re.IGNORECASE) or re.search(r'\bNODE_API_PORT\b', line2):
             has_node_api_rule = True
 
-        # insert allow right after control plane allow, if node api allow absent
         if (not has_node_api_rule) and re.search(r'@control_plane_sources', line2) and re.search(r'\bdport\b', line2):
             out.append(line2)
-            # Use define if exists/inserted, else direct number
             if has_define_node_api or inserted_define_node_api:
                 out.append('        ip saddr @control_plane_sources tcp dport $NODE_API_PORT ct state new accept comment "Remnawave node API"\n')
             else:
@@ -555,7 +483,6 @@ for idx, line in enumerate(lines):
             has_node_api_rule = True
             continue
 
-        # end of chain
         if line2.strip() == "}" and input_depth == 0:
             out.append(line2)
             in_chain_input = False
@@ -566,7 +493,6 @@ for idx, line in enumerate(lines):
 
     out.append(line2)
 
-# If MONITORING_PORT define wasn't present and we didn't insert NODE_API define yet, insert near top (after SSH_PORT define if any)
 if (not has_define_node_api) and (not inserted_define_node_api):
     new_out = []
     inserted = False
@@ -765,9 +691,10 @@ show_logs_and_status() {
 main() {
   require_root
   clear || true
-  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (repo-first + safe nftables) ===${R0}"
+  echo -e "${CY}${B0}=== VPS SETUP (ONLY ROOT PASS + SSH PORT) + Observer Node Installer (repo-first + safe nftables) ===${R0}"
   echo
 
+  # Оставляем как было: без fail2ban/sysctl/ufw
   apt_install ca-certificates curl iproute2 openssh-server coreutils nftables netcat-openbsd
   ensure_git_python_yaml
   ensure_docker
@@ -794,6 +721,7 @@ main() {
   ensure_run_sshd_dir
   ssh_hardening_port "${SSH_PORT}"
 
+  # Дальше — всё как было (nftables/observer/docker) — не меняем
   clone_or_update_repo
 
   apply_nftables_from_repo_example \
@@ -803,10 +731,6 @@ main() {
     "${NODE_API_PORT}" \
     "${CONTROL_IPS}" \
     "${MONITOR_IPS}"
-
-  setup_fail2ban
-  setup_sysctl
-  disable_ufw
 
   echo
   echo -e "${MG}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
@@ -841,13 +765,11 @@ main() {
   ok "Готово"
   echo
 
-  # Быстрая самопроверка портов
   echo -e "${WT}${B0}Порты на хосте:${R0}"
   ss -lntp | grep -E ":${SSH_PORT}\b|:${NODE_API_PORT}\b|:80\b|:443\b|:${MONITORING_PORT}\b" || true
   echo
 
   echo -e "${WT}${B0}Проверка доступа к RabbitMQ:${R0}"
-  # (Это проверка "с ноды до панели", inbound на панели — не наша зона)
   host="$(echo "$RABBITMQ_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+).*$#\2#')"
   port="$(echo "$RABBITMQ_URL" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+):([0-9]+).*$#\3#p')"
   [[ -n "${port:-}" ]] || port="38214"
@@ -858,7 +780,7 @@ main() {
 
   echo
   echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
-  echo -e "${YL}${B0}ВАЖНО:${R0} nftables теперь разрешает NODE_API_PORT=${NODE_API_PORT} только от CONTROL_IPS (${CONTROL_IPS})."
+  echo -e "${YL}${B0}ВАЖНО:${R0} nftables разрешает NODE_API_PORT=${NODE_API_PORT} только от CONTROL_IPS (${CONTROL_IPS})."
 }
 
 main "$@"
