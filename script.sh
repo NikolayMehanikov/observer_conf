@@ -67,8 +67,14 @@ cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 apt_install() {
   local pkgs=("$@")
   start_spinner "Установка пакетов: ${pkgs[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1; then
+    stop_spinner_fail
+    apt-get update -y || true
+    echo -e "${YL}${B0}apt_install не смог поставить:${R0} ${pkgs[*]}"
+    echo -e "${D0}Попробуй руками: apt-get install -y ${pkgs[*]}${R0}"
+    die "Ошибка установки пакетов"
+  fi
   stop_spinner_ok
 }
 
@@ -130,7 +136,6 @@ validate_ipv4_one() {
 }
 
 normalize_ipv4_list_to_nft_elements() {
-  # Ввод: "1.1.1.1, 2.2.2.2;3.3.3.3" -> "1.1.1.1, 2.2.2.2, 3.3.3.3"
   local raw="$1"
   local cleaned
   cleaned="$(echo "$raw" | tr ',;' '  ' | tr -s ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -162,17 +167,131 @@ ensure_git_python_yaml() {
   ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
 }
 
+get_os_id() { . /etc/os-release; echo "${ID:-}"; }
+
+get_codename() {
+  . /etc/os-release
+  if [[ -n "${VERSION_CODENAME:-}" ]]; then
+    echo "${VERSION_CODENAME}"
+    return 0
+  fi
+  if cmd_exists lsb_release; then
+    lsb_release -cs
+    return 0
+  fi
+  if [[ "${ID:-}" == "debian" && -f /etc/debian_version ]]; then
+    local maj
+    maj="$(cut -d. -f1 /etc/debian_version 2>/dev/null || true)"
+    case "$maj" in
+      12) echo "bookworm" ;;
+      11) echo "bullseye" ;;
+      10) echo "buster" ;;
+      *)  echo "bookworm" ;;
+    esac
+    return 0
+  fi
+  echo ""
+}
+
+install_compose_plugin_binary_fallback() {
+  start_spinner "Fallback: установка Docker Compose v2 (CLI plugin) бинарником"
+  mkdir -p /usr/local/lib/docker/cli-plugins
+
+  local arch uname_m
+  uname_m="$(uname -m)"
+  case "$uname_m" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="aarch64" ;;
+    armv7l|armhf)  arch="armv7" ;;
+    *) stop_spinner_fail; die "Неизвестная архитектура: ${uname_m}" ;;
+  esac
+
+  local url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}"
+  if ! curl -fsSL "$url" -o /usr/local/lib/docker/cli-plugins/docker-compose; then
+    stop_spinner_fail
+    die "Не смог скачать compose plugin с GitHub (${url}). Возможно, сеть/блокировка."
+  fi
+  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  stop_spinner_ok
+}
+
+add_docker_official_repo() {
+  local os_id codename arch
+  os_id="$(get_os_id)"
+  codename="$(get_codename)"
+  arch="$(dpkg --print-architecture)"
+
+  [[ -n "$os_id" ]] || die "Не смог определить ID ОС (/etc/os-release)."
+  [[ -n "$codename" ]] || die "Не смог определить codename ОС (VERSION_CODENAME/lsb_release)."
+
+  start_spinner "Добавляю официальный репозиторий Docker (${os_id} ${codename})"
+  apt_install ca-certificates curl gnupg lsb-release
+
+  install -m 0755 -d /etc/apt/keyrings
+  rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg || true
+
+  if ! curl -fsSL "https://download.docker.com/linux/${os_id}/gpg" -o /etc/apt/keyrings/docker.asc; then
+    stop_spinner_fail
+    die "Не смог скачать GPG ключ Docker (download.docker.com)."
+  fi
+  chmod a+r /etc/apt/keyrings/docker.asc
+
+  cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${os_id} ${codename} stable
+EOF
+
+  apt-get update -y >/dev/null 2>&1 || true
+  stop_spinner_ok
+}
+
 ensure_docker() {
-  if ! cmd_exists docker; then
-    warn "Docker не найден. Ставлю docker.io + compose plugin."
-    apt_install ca-certificates curl gnupg lsb-release
-    apt_install docker.io docker-compose-plugin
+  if cmd_exists docker; then
     systemctl enable --now docker >/dev/null 2>&1 || true
   else
+    warn "Docker не найден. Устанавливаю."
+
+    start_spinner "Пробую установить docker.io + docker-compose-plugin из текущих реп"
+    apt-get update -y >/dev/null 2>&1 || true
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-plugin >/dev/null 2>&1; then
+      stop_spinner_ok
+      ok "Docker установлен из текущих реп (docker.io)"
+    else
+      stop_spinner_fail
+      warn "В текущих репозиториях нет docker-compose-plugin (или ошибка). Перехожу на официальный репозиторий Docker."
+
+      add_docker_official_repo
+
+      start_spinner "Установка Docker Engine + compose-plugin из официального репо"
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
+        stop_spinner_ok
+        ok "Docker установлен из официального репозитория Docker"
+      else
+        stop_spinner_fail
+        warn "Не удалось поставить docker-compose-plugin через apt. Делаю бинарный fallback."
+
+        if ! cmd_exists docker; then
+          warn "Docker всё ещё не установлен — ставлю docker.io (без compose) как минимум."
+          apt_install docker.io
+        fi
+
+        install_compose_plugin_binary_fallback
+      fi
+    fi
+
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
+
   docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
+
+  if ! docker compose version >/dev/null 2>&1; then
+    warn "docker compose пока не доступен, делаю бинарный fallback"
+    install_compose_plugin_binary_fallback
+    docker compose version >/dev/null 2>&1 || die "docker compose всё равно не работает"
+  fi
+
   ok "Docker работает"
+  info "Docker: $(docker --version 2>/dev/null || true)"
+  info "Compose: $(docker compose version 2>/dev/null || true)"
 }
 
 detect_ssh_unit() {
@@ -228,7 +347,6 @@ restart_ssh_and_verify() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   ensure_run_sshd_dir
 
-  # socket activation (если есть)
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
     systemctl restart ssh.socket >/dev/null 2>&1 || true
   fi
@@ -694,7 +812,6 @@ main() {
   echo -e "${CY}${B0}=== VPS SETUP (ONLY ROOT PASS + SSH PORT) + Observer Node Installer (repo-first + safe nftables) ===${R0}"
   echo
 
-  # Оставляем как было: без fail2ban/sysctl/ufw
   apt_install ca-certificates curl iproute2 openssh-server coreutils nftables netcat-openbsd
   ensure_git_python_yaml
   ensure_docker
@@ -721,7 +838,6 @@ main() {
   ensure_run_sshd_dir
   ssh_hardening_port "${SSH_PORT}"
 
-  # Дальше — всё как было (nftables/observer/docker) — не меняем
   clone_or_update_repo
 
   apply_nftables_from_repo_example \
