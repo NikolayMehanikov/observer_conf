@@ -16,23 +16,15 @@ WT=$'\033[37m'
 
 SPIN_CHARS='|/-\'
 SPIN_PID=""
-SPIN_ACTIVE=0
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
 ok()  { echo -e "${GN}${B0}✔${R0} $*"; }
 info(){ echo -e "${CY}${B0}➜${R0} $*"; }
 warn(){ echo -e "${YL}${B0}⚠${R0} $*"; }
 
-# ---- spinner ----
 start_spinner() {
   local msg="$1"
-  # если вдруг предыдущий не убит — прибьём
-  stop_spinner_silent || true
-
-  SPIN_ACTIVE=1
-  # сообщение на отдельной строке
   echo -ne "${BL}${B0}⟲${R0} ${msg} "
-
   (
     local i=0
     while :; do
@@ -44,26 +36,13 @@ start_spinner() {
   SPIN_PID="$!"
 }
 
-stop_spinner_silent() {
-  if [[ -n "${SPIN_PID}" ]]; then
-    kill "${SPIN_PID}" >/dev/null 2>&1 || true
-    wait "${SPIN_PID}" >/dev/null 2>&1 || true
-    SPIN_PID=""
-  fi
-  SPIN_ACTIVE=0
-  # очистить текущую строку (на случай, если крутилось)
-  printf "\r\033[K"
-}
-
 stop_spinner_ok() {
   if [[ -n "${SPIN_PID}" ]]; then
     kill "${SPIN_PID}" >/dev/null 2>&1 || true
     wait "${SPIN_PID}" >/dev/null 2>&1 || true
     SPIN_PID=""
+    echo -e "\b${GN}${B0}✔${R0}"
   fi
-  SPIN_ACTIVE=0
-  # завершить строку красиво и ПЕРЕЙТИ НА НОВУЮ СТРОКУ
-  echo -e "\b${GN}${B0}✔${R0}"
 }
 
 stop_spinner_fail() {
@@ -71,9 +50,8 @@ stop_spinner_fail() {
     kill "${SPIN_PID}" >/dev/null 2>&1 || true
     wait "${SPIN_PID}" >/dev/null 2>&1 || true
     SPIN_PID=""
+    echo -e "\b${RD}${B0}✖${R0}"
   fi
-  SPIN_ACTIVE=0
-  echo -e "\b${RD}${B0}✖${R0}"
 }
 
 on_err() {
@@ -82,7 +60,6 @@ on_err() {
   echo -e "${D0}Строка:${R0} ${BASH_LINENO[0]}  ${D0}Команда:${R0} ${BASH_COMMAND}"
 }
 trap on_err ERR
-trap 'stop_spinner_silent || true' EXIT
 
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -90,12 +67,8 @@ cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 apt_install() {
   local pkgs=("$@")
   start_spinner "Установка пакетов: ${pkgs[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null 2>&1; then
-    stop_spinner_fail
-    apt-get update -y >/dev/null 2>&1 || true
-    die "Не удалось установить пакеты: ${pkgs[*]}"
-  fi
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" >/dev/null
   stop_spinner_ok
 }
 
@@ -107,14 +80,11 @@ backup_file() {
   cp -a "$f" "${f}.bak.${ts}"
 }
 
-# ---- input helpers (важно: гасим спиннер перед вводом!) ----
 read_nonempty() {
-  stop_spinner_silent || true
   local prompt="$1"
   local varname="$2"
   local secret="${3:-0}"
   local value=""
-
   while [[ -z "${value}" ]]; do
     if [[ "${secret}" == "1" ]]; then
       read -r -s -p "$(echo -e "${B0}${prompt}${R0} ")" value
@@ -129,12 +99,10 @@ read_nonempty() {
 }
 
 read_with_default() {
-  stop_spinner_silent || true
   local prompt="$1"
   local def="$2"
   local varname="$3"
   local value=""
-
   read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}(Enter = ${def})${R0} ")" value || true
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
@@ -162,6 +130,7 @@ validate_ipv4_one() {
 }
 
 normalize_ipv4_list_to_nft_elements() {
+  # Ввод: "1.1.1.1, 2.2.2.2;3.3.3.3" -> "1.1.1.1, 2.2.2.2, 3.3.3.3"
   local raw="$1"
   local cleaned
   cleaned="$(echo "$raw" | tr ',;' '  ' | tr -s ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -193,111 +162,17 @@ ensure_git_python_yaml() {
   ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
 }
 
-get_os_id() { . /etc/os-release; echo "${ID:-}"; }
-
-get_codename() {
-  . /etc/os-release
-  if [[ -n "${VERSION_CODENAME:-}" ]]; then
-    echo "${VERSION_CODENAME}"
-    return 0
-  fi
-  if cmd_exists lsb_release; then
-    lsb_release -cs
-    return 0
-  fi
-  echo ""
-}
-
-install_compose_plugin_binary_fallback() {
-  start_spinner "Fallback: установка Docker Compose v2 (CLI plugin) бинарником"
-  mkdir -p /usr/local/lib/docker/cli-plugins
-
-  local arch uname_m
-  uname_m="$(uname -m)"
-  case "$uname_m" in
-    x86_64|amd64) arch="x86_64" ;;
-    aarch64|arm64) arch="aarch64" ;;
-    armv7l|armhf)  arch="armv7" ;;
-    *) stop_spinner_fail; die "Неизвестная архитектура: ${uname_m}" ;;
-  esac
-
-  local url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}"
-  if ! curl -fsSL "$url" -o /usr/local/lib/docker/cli-plugins/docker-compose; then
-    stop_spinner_fail
-    die "Не смог скачать compose plugin (${url}). Возможно, блокировка GitHub."
-  fi
-  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-  stop_spinner_ok
-}
-
-add_docker_official_repo() {
-  local os_id codename arch
-  os_id="$(get_os_id)"
-  codename="$(get_codename)"
-  arch="$(dpkg --print-architecture)"
-
-  [[ -n "$os_id" ]] || die "Не смог определить ID ОС (/etc/os-release)."
-  [[ -n "$codename" ]] || die "Не смог определить codename ОС."
-
-  start_spinner "Добавляю официальный репозиторий Docker (${os_id} ${codename})"
-  apt_install ca-certificates curl gnupg lsb-release
-
-  install -m 0755 -d /etc/apt/keyrings
-  rm -f /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg || true
-
-  curl -fsSL "https://download.docker.com/linux/${os_id}/gpg" -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-
-  cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${os_id} ${codename} stable
-EOF
-
-  apt-get update -y >/dev/null 2>&1 || true
-  stop_spinner_ok
-}
-
 ensure_docker() {
-  if cmd_exists docker; then
+  if ! cmd_exists docker; then
+    warn "Docker не найден. Ставлю docker.io + compose plugin."
+    apt_install ca-certificates curl gnupg lsb-release
+    apt_install docker.io docker-compose-plugin
     systemctl enable --now docker >/dev/null 2>&1 || true
   else
-    warn "Docker не найден. Устанавливаю."
-
-    start_spinner "Пробую docker.io + docker-compose-plugin из текущих реп"
-    apt-get update -y >/dev/null 2>&1 || true
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-plugin >/dev/null 2>&1; then
-      stop_spinner_ok
-    else
-      stop_spinner_fail
-      warn "В текущих репах нет docker-compose-plugin. Перехожу на официальный репо Docker."
-      add_docker_official_repo
-
-      start_spinner "Установка Docker Engine + compose-plugin (официальный репо)"
-      if DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
-        stop_spinner_ok
-      else
-        stop_spinner_fail
-        warn "Не удалось поставить compose-plugin через apt. Делаю бинарный fallback."
-        if ! cmd_exists docker; then
-          apt_install docker.io
-        fi
-        install_compose_plugin_binary_fallback
-      fi
-    fi
-
     systemctl enable --now docker >/dev/null 2>&1 || true
   fi
-
   docker info >/dev/null 2>&1 || die "Docker не запускается. Проверь: systemctl status docker"
-
-  if ! docker compose version >/dev/null 2>&1; then
-    warn "docker compose пока не доступен — делаю бинарный fallback"
-    install_compose_plugin_binary_fallback
-    docker compose version >/dev/null 2>&1 || die "docker compose всё равно не работает"
-  fi
-
   ok "Docker работает"
-  info "Docker: $(docker --version 2>/dev/null || true)"
-  info "Compose: $(docker compose version 2>/dev/null || true)"
 }
 
 detect_ssh_unit() {
@@ -353,6 +228,7 @@ restart_ssh_and_verify() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   ensure_run_sshd_dir
 
+  # socket activation (если есть)
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
     systemctl restart ssh.socket >/dev/null 2>&1 || true
   fi
@@ -409,7 +285,7 @@ EOF
   if ! sshd -t >/dev/null 2>&1; then
     stop_spinner_fail
     sshd -t || true
-    die "sshd_config невалиден. Проверь ${dropin_file}"
+    die "sshd_config невалиден после изменений. Проверь ${dropin_file}"
   fi
 
   local unit
@@ -423,14 +299,54 @@ EOF
 }
 
 set_root_password() {
-  stop_spinner_silent || true
   echo -e "${CY}${B0}ROOT пароль:${R0}"
   passwd root
   ok "Пароль root изменён"
 }
 
-# ---- дальше твой код без изменений (repo/nft/vector/compose) ----
-# (оставил как есть)
+setup_fail2ban() {
+  apt_install fail2ban
+  start_spinner "Настройка Fail2Ban"
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+bantime = 30m
+findtime = 10m
+maxretry = 5
+backend = systemd
+EOF
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "Fail2Ban активирован"
+}
+
+setup_sysctl() {
+  start_spinner "Применение sysctl"
+  cat > /etc/sysctl.d/99-hardening.conf <<EOF
+net.ipv4.icmp_echo_ignore_all = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "sysctl применён"
+}
+
+disable_ufw() {
+  start_spinner "Отключение UFW"
+  systemctl stop ufw >/dev/null 2>&1 || true
+  systemctl disable ufw >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "UFW выключен"
+}
+
 clone_or_update_repo() {
   local dst="/opt/remnawave-observer"
   local url="https://github.com/0FL01/remnawave-observer.git"
@@ -451,7 +367,6 @@ clone_or_update_repo() {
 }
 
 apply_nftables_from_repo_example() {
-  # ВАЖНО: как ты просил — логику nftables не менял, только оставил из твоего варианта
   local ssh_port="$1"
   local control_port="$2"
   local monitoring_port="$3"
@@ -483,7 +398,9 @@ MONITOR_ELEMS = sys.argv[7]
 with open(src, "r", encoding="utf-8") as f:
     lines = f.readlines()
 
+# --- helpers ---
 def replace_define(line: str, name: str, value: str) -> str:
+    # define NAME = 123
     pattern = re.compile(rf'^(\s*define\s+{re.escape(name)}\s*=\s*)\d+(\s*)$', re.IGNORECASE)
     m = pattern.match(line.rstrip("\n"))
     if not m:
@@ -508,25 +425,39 @@ in_chain_input = False
 input_depth = 0
 has_node_api_rule = False
 
+# First pass: detect if template has NODE_API define already
 has_define_node_api = any(re.match(r'^\s*define\s+NODE_API_PORT\s*=\s*\d+', ln.strip(), re.IGNORECASE) for ln in lines)
+
+# For insertion positions
 inserted_define_node_api = False
 
 for idx, line in enumerate(lines):
+    # Replace common defines if present
     line2 = line
     line2 = replace_define(line2, "SSH_PORT", SSH_PORT)
     line2 = replace_define(line2, "CONTROL_PORT", CONTROL_PORT)
     line2 = replace_define(line2, "MONITORING_PORT", MONITORING_PORT)
 
+    # If NODE_API define exists in template, replace it too
     if has_define_node_api:
         line2 = replace_define(line2, "NODE_API_PORT", NODE_API_PORT)
 
+    # If template doesn't have NODE_API define, insert it after MONITORING_PORT define if we see it,
+    # otherwise after CONTROL_PORT or SSH_PORT define (first matched).
     if not has_define_node_api and not inserted_define_node_api:
         if re.match(r'^\s*define\s+MONITORING_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
             out.append(line2)
             out.append(f"define NODE_API_PORT = {NODE_API_PORT}\n")
             inserted_define_node_api = True
             continue
+        if re.match(r'^\s*define\s+CONTROL_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
+            # не вставляем тут, только запоминаем — лучше после MONITORING_PORT, но если её нет — вставим позже
+            pass
+        if re.match(r'^\s*define\s+SSH_PORT\s*=\s*\d+', line2.strip(), re.IGNORECASE):
+            # тоже не вставляем сразу
+            pass
 
+    # Detect sets blocks for IP replacement
     if re.match(r'^\s*set\s+control_plane_sources\s*\{', line2):
         in_control_set = True
         in_monitor_set = False
@@ -546,11 +477,13 @@ for idx, line in enumerate(lines):
         out.append(f"{m_elems.group(1)}{MONITOR_ELEMS}{m_elems.group(3)}\n")
         continue
 
+    # End of set blocks
     if in_control_set and line2.strip().startswith("}"):
         in_control_set = False
     if in_monitor_set and line2.strip().startswith("}"):
         in_monitor_set = False
 
+    # Forward chain logic
     if re.match(r'^\s*chain\s+forward\s*\{', line2):
         in_chain_forward = True
         forward_depth = 1
@@ -558,6 +491,7 @@ for idx, line in enumerate(lines):
         continue
 
     if in_chain_forward:
+        # track depth
         forward_depth += line2.count("{")
         forward_depth -= line2.count("}")
 
@@ -570,14 +504,20 @@ for idx, line in enumerate(lines):
         if 'oifname "br-"' in line2 or 'oifname "br-*" ' in line2 or 'oifname "br-*"'.strip() in line2:
             forward_has_br_oif = True
 
+        # REMOVE dangerous unconditional drop in forward chain, if present
         if is_forward_drop(line2):
             continue
 
+        # Before closing brace of forward chain (depth will become 0 after this line if it contains '}')
         if line2.strip() == "}" and forward_depth == 0:
+            # Insert safe docker forward accepts (only if not already present)
             if not forward_has_docker0_iif:
                 out.append('        iifname "docker0" accept comment "Allow docker0 forward in"\n')
             if not forward_has_docker0_oif:
                 out.append('        oifname "docker0" accept comment "Allow docker0 forward out"\n')
+            # Bridge interfaces (compose networks) — wildcard via sets is not available in pure nft, but br-* is used often in docs.
+            # Use meta iifname/oifname with prefix match through regex (nft supports regex for iifname in some builds; if not, user still has docker0)
+            # We'll use explicit common pattern br-*
             if not forward_has_br_iif:
                 out.append('        iifname "br-*" accept comment "Allow docker bridge forward in"\n')
             if not forward_has_br_oif:
@@ -589,6 +529,7 @@ for idx, line in enumerate(lines):
         out.append(line2)
         continue
 
+    # Input chain logic (for NODE_API allow)
     if re.match(r'^\s*chain\s+filter_input\s*\{', line2):
         in_chain_input = True
         input_depth = 1
@@ -599,11 +540,14 @@ for idx, line in enumerate(lines):
         input_depth += line2.count("{")
         input_depth -= line2.count("}")
 
+        # detect existing node api rule
         if re.search(r'\bRemnawave\b.*\bnode\b.*\bAPI\b', line2, re.IGNORECASE) or re.search(r'\bNODE_API_PORT\b', line2):
             has_node_api_rule = True
 
+        # insert allow right after control plane allow, if node api allow absent
         if (not has_node_api_rule) and re.search(r'@control_plane_sources', line2) and re.search(r'\bdport\b', line2):
             out.append(line2)
+            # Use define if exists/inserted, else direct number
             if has_define_node_api or inserted_define_node_api:
                 out.append('        ip saddr @control_plane_sources tcp dport $NODE_API_PORT ct state new accept comment "Remnawave node API"\n')
             else:
@@ -611,6 +555,7 @@ for idx, line in enumerate(lines):
             has_node_api_rule = True
             continue
 
+        # end of chain
         if line2.strip() == "}" and input_depth == 0:
             out.append(line2)
             in_chain_input = False
@@ -621,6 +566,7 @@ for idx, line in enumerate(lines):
 
     out.append(line2)
 
+# If MONITORING_PORT define wasn't present and we didn't insert NODE_API define yet, insert near top (after SSH_PORT define if any)
 if (not has_define_node_api) and (not inserted_define_node_api):
     new_out = []
     inserted = False
@@ -819,7 +765,7 @@ show_logs_and_status() {
 main() {
   require_root
   clear || true
-  echo -e "${CY}${B0}=== VPS SETUP (ONLY ROOT PASS + SSH PORT) + Observer Node Installer (repo-first + safe nftables) ===${R0}"
+  echo -e "${CY}${B0}=== VPS HARDENING + Observer Node Installer (repo-first + safe nftables) ===${R0}"
   echo
 
   apt_install ca-certificates curl iproute2 openssh-server coreutils nftables netcat-openbsd
@@ -858,6 +804,10 @@ main() {
     "${CONTROL_IPS}" \
     "${MONITOR_IPS}"
 
+  setup_fail2ban
+  setup_sysctl
+  disable_ufw
+
   echo
   echo -e "${MG}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
   echo
@@ -891,11 +841,13 @@ main() {
   ok "Готово"
   echo
 
+  # Быстрая самопроверка портов
   echo -e "${WT}${B0}Порты на хосте:${R0}"
   ss -lntp | grep -E ":${SSH_PORT}\b|:${NODE_API_PORT}\b|:80\b|:443\b|:${MONITORING_PORT}\b" || true
   echo
 
   echo -e "${WT}${B0}Проверка доступа к RabbitMQ:${R0}"
+  # (Это проверка "с ноды до панели", inbound на панели — не наша зона)
   host="$(echo "$RABBITMQ_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+).*$#\2#')"
   port="$(echo "$RABBITMQ_URL" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+):([0-9]+).*$#\3#p')"
   [[ -n "${port:-}" ]] || port="38214"
@@ -906,7 +858,7 @@ main() {
 
   echo
   echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
-  echo -e "${YL}${B0}ВАЖНО:${R0} nftables разрешает NODE_API_PORT=${NODE_API_PORT} только от CONTROL_IPS (${CONTROL_IPS})."
+  echo -e "${YL}${B0}ВАЖНО:${R0} nftables теперь разрешает NODE_API_PORT=${NODE_API_PORT} только от CONTROL_IPS (${CONTROL_IPS})."
 }
 
 main "$@"
