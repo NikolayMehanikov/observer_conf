@@ -772,16 +772,16 @@ main() {
   ensure_git_python_yaml
   ensure_docker
 
-  read_nonempty "Новый SSH порт (например 50012):" SSH_PORT 0
+  read_nonempty "Новый SSH порт (например 5129):" SSH_PORT 0
   validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
 
-  read_with_default "CONTROL_PORT (порт control-plane/админки по доке):" "4431" CONTROL_PORT
+  read_with_default "CONTROL_PORT (порт ноды):" "4431" CONTROL_PORT
   validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
 
   read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
   validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
 
-  read_with_default "NODE_API_PORT (порт API ноды Remnawave, обычно 2041):" "2041" NODE_API_PORT
+  read_with_default "NODE_API_PORT (порт ноды):" "2041" NODE_API_PORT
   validate_port "${NODE_API_PORT}" || die "NODE_API_PORT невалидный"
 
   read_nonempty "IPv4 адрес главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
@@ -812,11 +812,11 @@ main() {
   echo -e "${MG}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
   echo
 
-  read_nonempty "Домен центрального Observer (пример: obs.noctacore.com):" OBS_DOMAIN 0
+  read_nonempty "Домен центрального Observer (пример: Obsexpm.core.net):" OBS_DOMAIN 0
   OBS_DOMAIN="$(echo "$OBS_DOMAIN" | sed -E 's#^https?://##; s#/.*$##')"
   [[ -n "$OBS_DOMAIN" ]] || die "Домен пустой"
 
-  read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:38214/):" RABBITMQ_URL 0
+  read_nonempty "RabbitMQ URL (пример: amqps://user:pass@${OBS_DOMAIN}:1234/):" RABBITMQ_URL 0
   [[ -n "$RABBITMQ_URL" ]] || die "RabbitMQ URL пустой"
 
   ensure_remnanode_paths
