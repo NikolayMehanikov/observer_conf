@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 export LC_ALL=C
 
+# ===== Pretty =====
 R0=$'\033[0m'
 B0=$'\033[1m'
 D0=$'\033[2m'
@@ -19,8 +20,8 @@ SPIN_PID=""
 
 die() { echo -e "${RD}${B0}✖${R0} $*" >&2; exit 1; }
 ok()  { echo -e "${GN}${B0}✔${R0} $*"; }
-info(){ echo -e "${CY}${B0}➜${R0} $*"; }
 warn(){ echo -e "${YL}${B0}⚠${R0} $*"; }
+info(){ echo -e "${CY}${B0}➜${R0} $*"; }
 
 start_spinner() {
   local msg="$1"
@@ -35,7 +36,6 @@ start_spinner() {
   ) &
   SPIN_PID="$!"
 }
-
 stop_spinner_ok() {
   if [[ -n "${SPIN_PID}" ]]; then
     kill "${SPIN_PID}" >/dev/null 2>&1 || true
@@ -44,7 +44,6 @@ stop_spinner_ok() {
     echo -e "\b${GN}${B0}✔${R0}"
   fi
 }
-
 stop_spinner_fail() {
   if [[ -n "${SPIN_PID}" ]]; then
     kill "${SPIN_PID}" >/dev/null 2>&1 || true
@@ -53,7 +52,6 @@ stop_spinner_fail() {
     echo -e "\b${RD}${B0}✖${R0}"
   fi
 }
-
 on_err() {
   stop_spinner_fail || true
   echo -e "${RD}${B0}Ошибка${R0}: команда завершилась неуспешно."
@@ -64,6 +62,7 @@ trap on_err ERR
 require_root() { [[ "${EUID}" -eq 0 ]] || die "Запусти от root: sudo -i"; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
+# ===== Utils =====
 apt_install() {
   local pkgs=("$@")
   start_spinner "Установка пакетов: ${pkgs[*]}"
@@ -78,7 +77,21 @@ backup_file() {
   local ts
   ts="$(date +%Y%m%d-%H%M%S)"
   cp -a "$f" "${f}.bak.${ts}"
-  ok "Backup: ${f}.bak.${ts}"
+}
+
+read_yes_no_default_yes() {
+  local prompt="$1"
+  local ans=""
+  while :; do
+    read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}[Y/n]${R0} ")" ans || true
+    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$ans" ]] && ans="y"
+    case "$ans" in
+      y|yes) echo "y"; return 0 ;;
+      n|no)  echo "n"; return 0 ;;
+      *) warn "Введи y или n." ;;
+    esac
+  done
 }
 
 read_nonempty() {
@@ -107,23 +120,8 @@ read_with_default() {
   read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}(Enter = ${def})${R0} ")" value || true
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
-  if [[ -z "$value" ]]; then value="$def"; fi
+  [[ -z "$value" ]] && value="$def"
   printf -v "${varname}" '%s' "${value}"
-}
-
-read_yes_no_default_yes() {
-  local prompt="$1"
-  local ans=""
-  while :; do
-    read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}[Y/n]${R0} ")" ans || true
-    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
-    [[ -z "$ans" ]] && ans="y"
-    case "$ans" in
-      y|yes) echo "y"; return 0 ;;
-      n|no)  echo "n"; return 0 ;;
-      *) warn "Введи y или n." ;;
-    esac
-  done
 }
 
 validate_port() {
@@ -148,6 +146,7 @@ normalize_ipv4_list_to_nft_elements() {
   local cleaned
   cleaned="$(echo "$raw" | tr ',;' '  ' | tr -s ' ' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
   [[ -n "$cleaned" ]] || die "IP список пустой"
+
   local out=()
   local ip
   while read -r ip; do
@@ -167,11 +166,11 @@ normalize_ipv4_list_to_nft_elements() {
   echo "$joined"
 }
 
+# ===== Docker =====
 ensure_docker() {
   if ! cmd_exists docker; then
     warn "Docker не найден. Ставлю docker.io + compose plugin."
-    apt_install ca-certificates curl gnupg lsb-release
-    apt_install docker.io docker-compose-plugin
+    apt_install ca-certificates curl gnupg lsb-release docker.io docker-compose-plugin
     systemctl enable --now docker >/dev/null 2>&1 || true
   else
     systemctl enable --now docker >/dev/null 2>&1 || true
@@ -180,6 +179,73 @@ ensure_docker() {
   ok "Docker работает"
 }
 
+ensure_git_python_yaml() {
+  local need=()
+  cmd_exists git || need+=(git)
+  cmd_exists python3 || need+=(python3)
+  python3 -c "import yaml" >/dev/null 2>&1 || need+=(python3-yaml)
+  ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
+}
+
+# ===== Network detect =====
+detect_wan_if() {
+  local dev=""
+  dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [[ -z "$dev" ]] && dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  [[ -n "$dev" ]] || die "Не смог определить WAN интерфейс. Покажи: ip route; ip -br link"
+  ip link show "$dev" >/dev/null 2>&1 || die "WAN интерфейс '$dev' не найден"
+  echo "$dev"
+}
+
+detect_ssh_port() {
+  # 1) sshd -T (если доступно)
+  if cmd_exists sshd; then
+    local p=""
+    p="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}' || true)"
+    if [[ -n "${p:-}" ]] && validate_port "$p"; then
+      echo "$p"
+      return 0
+    fi
+  fi
+
+  # 2) ss: LISTEN sshd
+  if cmd_exists ss; then
+    local p2=""
+    p2="$(ss -lntp 2>/dev/null | awk '
+      /LISTEN/ && ($0 ~ /sshd|\/sshd/){
+        match($0, /:([0-9]{1,5})[[:space:]]/, m);
+        if (m[1]!=""){ print m[1]; exit }
+      }' || true)"
+    if [[ -n "${p2:-}" ]] && validate_port "$p2"; then
+      echo "$p2"
+      return 0
+    fi
+  fi
+
+  # 3) parse configs
+  local ports=()
+  local f
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    while read -r f; do
+      [[ -f "$f" ]] || continue
+      while read -r p; do
+        [[ -n "$p" ]] || continue
+        validate_port "$p" && ports+=("$p")
+      done < <(awk 'BEGIN{IGNORECASE=1} $1=="port"{print $2}' "$f" 2>/dev/null || true)
+    done < <(
+      echo /etc/ssh/sshd_config
+      ls -1 /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+    )
+  fi
+  if ((${#ports[@]})); then
+    echo "${ports[0]}"
+    return 0
+  fi
+
+  echo "22"
+}
+
+# ===== SSH change (safe) =====
 detect_ssh_unit() {
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
   if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
@@ -241,25 +307,24 @@ restart_ssh_and_verify() {
 
   systemctl is-active --quiet "${unit}" || {
     echo -e "${RD}${B0}SSH unit не активен после рестарта.${R0}"
-    journalctl -u "${unit}" -n 200 --no-pager || true
+    journalctl -u "${unit}" -n 160 --no-pager || true
     die "SSH не поднялся после применения конфига"
   }
 
-  if ! cmd_exists ss; then apt_install iproute2; fi
+  cmd_exists ss || apt_install iproute2
   if ! ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${new_port}\b"; then
     echo -e "${RD}${B0}sshd не слушает порт ${new_port}.${R0}"
     ss -lntp 2>/dev/null | grep -i ssh || ss -lntp 2>/dev/null || true
-    sshd -T 2>/dev/null | awk '/^port /{print}' || true
     journalctl -u "${unit}" -n 200 --no-pager || true
     die "Порт не применился / sshd не слушает новый порт"
   fi
 }
 
-ssh_change_port_only() {
+ssh_change_port() {
   local new_port="$1"
   validate_port "$new_port" || die "Неверный порт SSH: $new_port"
 
-  start_spinner "Меняю SSH порт на ${new_port}"
+  start_spinner "Настройка SSH (порт ${new_port})"
 
   local dropin_dir="/etc/ssh/sshd_config.d"
   local dropin_file="${dropin_dir}/99-custom.conf"
@@ -271,12 +336,18 @@ ssh_change_port_only() {
   cat > "${dropin_file}" <<EOF
 # Managed by installer script
 Port ${new_port}
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication yes
+PrintMotd no
+Banner none
 EOF
 
   comment_out_other_port_directives "${dropin_file}"
   ensure_run_sshd_dir
 
-  if ! sshd -t >/dev/null 2>&1; then
+  if cmd_exists sshd && ! sshd -t >/dev/null 2>&1; then
     stop_spinner_fail
     sshd -t || true
     die "sshd_config невалиден после изменений. Проверь ${dropin_file}"
@@ -288,21 +359,31 @@ EOF
   restart_ssh_and_verify "${unit}" "${new_port}"
 
   stop_spinner_ok
-  ok "SSH порт применён: ${new_port}"
+  ok "SSH применён. Новый порт: ${new_port}"
   echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии: ${B0}ssh -p ${new_port} root@<IP>${R0}"
 }
 
-set_root_password() {
-  echo -e "${CY}${B0}Смена пароля root:${R0}"
-  passwd root
-  ok "Пароль root изменён"
+# ===== Root password =====
+generate_root_password() {
+  # 24 chars: letters+digits
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
 }
 
-setup_fail2ban_sshd_only() {
+set_root_password_generated() {
+  local pass
+  pass="$(generate_root_password)"
+  echo "root:${pass}" | chpasswd
+  ok "ROOT пароль установлен (сгенерирован)."
+  echo -e "${YL}${B0}ROOT PASSWORD:${R0} ${B0}${pass}${R0}"
+  echo -e "${D0}Сохрани пароль в безопасном месте.${R0}"
+}
+
+# ===== Fail2Ban =====
+setup_fail2ban() {
   apt_install fail2ban
   start_spinner "Настройка Fail2Ban (sshd, maxretry=7)"
   mkdir -p /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+  cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
 [sshd]
 enabled = true
 bantime = 30m
@@ -313,39 +394,31 @@ EOF
   systemctl enable fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban >/dev/null 2>&1 || true
   stop_spinner_ok
-  ok "Fail2Ban активирован (maxretry=7)"
+  ok "Fail2Ban активирован"
 }
 
-detect_wan_if() {
-  local dev=""
-  dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  if [[ -z "$dev" ]]; then
-    dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  fi
-  [[ -n "$dev" ]] || die "Не смог определить WAN интерфейс. Покажи: ip route; ip -br link"
-  ip link show "$dev" >/dev/null 2>&1 || die "WAN интерфейс '$dev' не найден в системе"
-  echo "$dev"
-}
-
-write_nftables_safe_conf() {
+# ===== nftables (VPN-safe + Observer sets) =====
+write_and_apply_nftables_vpn_safe() {
   local ssh_port="$1"
   local control_port="$2"
   local monitoring_port="$3"
   local control_ips_csv="$4"
   local monitoring_ips_csv="$5"
-  local wan_if="$6"
-
-  local node_api_port="$control_port" # auto
 
   validate_port "$ssh_port" || die "SSH_PORT невалидный"
   validate_port "$control_port" || die "CONTROL_PORT невалидный"
   validate_port "$monitoring_port" || die "MONITORING_PORT невалидный"
 
+  local wan_if
+  wan_if="$(detect_wan_if)"
+
   local control_elems monitoring_elems
   control_elems="$(normalize_ipv4_list_to_nft_elements "$control_ips_csv")"
   monitoring_elems="$(normalize_ipv4_list_to_nft_elements "$monitoring_ips_csv")"
 
-  start_spinner "Пишу /etc/nftables.conf (VPN-safe + Observer user_blacklist)"
+  local node_api_port="$control_port" # NODE_API_PORT = CONTROL_PORT (как просил)
+
+  start_spinner "Пишу /etc/nftables.conf (VPN-safe, Observer-compatible)"
   backup_file /etc/nftables.conf
 
   cat > /etc/nftables.conf <<EOF
@@ -392,17 +465,18 @@ table inet firewall {
         flags timeout
         timeout 15m
         size 4096
-        comment "Temporary TLS flood sources"
     }
 
     chain prerouting {
         type filter hook prerouting priority raw; policy accept;
 
+        # Observer bans (важно для blocker-xray)
         ip saddr @user_blacklist drop comment "Drop traffic from policy violators (Observer IP-limit)"
 
-        # (Как у тебя в рабочих конфигах)
+        # IPv6 off (как у тебя)
         ip6 version 6 drop comment "Block IPv6 completely"
 
+        # Анти-спуфинг/мусор
         iif != lo ip saddr 127.0.0.0/8 drop comment "Block spoofed loopback from external"
         ip frag-off & 0x1fff != 0 drop comment "Drop fragmented packets"
 
@@ -423,13 +497,17 @@ table inet firewall {
 
         ct state established,related accept comment "Allow established forward"
 
-        # Ключ к тому, чтобы НЕ ломать VPN/контейнеры:
-        # разрешаем приватным подсетям выходить в интернет через WAN интерфейс.
-        oifname \$WAN_IF ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment "Allow private->WAN forward (vpn/docker)"
-
-        # Docker0 (если используется)
+        # Docker / compose networks (без regex, чтобы не ловить синтакс-ошибки)
         iifname "docker0" accept comment "Allow docker0 forward in"
         oifname "docker0" accept comment "Allow docker0 forward out"
+        iifname "br-*" accept comment "Allow docker bridge forward in"
+        oifname "br-*" accept comment "Allow docker bridge forward out"
+
+        # Если вдруг есть tun0/wg0 (не мешает, а иногда спасает)
+        iifname "tun0" oifname \$WAN_IF accept comment "Allow tun0 -> WAN"
+        iifname \$WAN_IF oifname "tun0" accept comment "Allow WAN -> tun0"
+        iifname "wg0"  oifname \$WAN_IF accept comment "Allow wg0 -> WAN"
+        iifname \$WAN_IF oifname "wg0"  accept comment "Allow WAN -> wg0"
     }
 
     chain output {
@@ -443,27 +521,41 @@ table inet firewall {
         ct state invalid drop comment "Drop invalid packets"
         ct state established,related accept comment "Allow established"
 
+        # Defense-in-depth (второй барьер)
         ip saddr @ddos_blacklist drop comment "Drop known DDoS sources"
-        ip saddr @user_blacklist drop comment "Drop Observer-banned IPs (defense-in-depth)"
+        ip saddr @user_blacklist drop comment "Drop Observer-banned IPs"
 
-        # Пинги НЕ запрещаем
+        #
+        # ICMP: НЕ ЛОМАЕМ ping и сетевые ошибки/PMTU
+        #
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "Allow ICMP errors"
-        ip protocol icmp icmp type echo-request accept comment "Allow ICMP ping"
+        ip protocol icmp icmp type echo-request limit rate 10/second burst 20 packets accept comment "Allow ICMP ping (limited)"
+        ip protocol icmp icmp type echo-request add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist ICMP flooders"
 
-        # TCP ping / SYN probes
-        tcp flags & (syn|ack) == syn ct state new accept comment "Allow TCP SYN probes"
+        #
+        # TCP SYN probe (tcp-ping тестеры)
+        #
+        tcp flags & (syn|ack) == syn ct state new limit rate 400/second burst 400 packets accept comment "Allow TCP SYN probes"
+        tcp flags & (syn|ack) == syn ct state new add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist TCP SYN flooders"
 
-        # SSH
+        #
+        # SSH (порт задаётся define)
+        #
         tcp dport \$SSH_PORT ct state new accept comment "SSH"
 
-        # Control / Node API / Monitoring (только от своих)
+        #
+        # Control / Node API / Monitoring (строго по source IP)
+        #
         ip saddr @control_plane_sources tcp dport \$CONTROL_PORT ct state new accept comment "Control plane"
         ip saddr @control_plane_sources tcp dport \$NODE_API_PORT ct state new accept comment "Remnawave node API"
         ip saddr @monitoring_sources     tcp dport \$MONITORING_PORT ct state new accept comment "Monitoring"
 
-        # Web
+        #
+        # WEB (80/443) — пропускаем, но защищаемся от явного TLS-flood
+        #
         ip saddr @tls_flood_sources drop comment "Drop TLS flooded IPs"
-        tcp dport 443 ct state new accept comment "HTTPS"
+        tcp dport 443 ct state new limit rate 800/second burst 800 packets accept comment "TLS connections"
+        tcp dport 443 ct state new add @tls_flood_sources { ip saddr timeout 15m } drop comment "TLS flood -> temp block"
         tcp dport 80  ct state new accept comment "HTTP (cert renewal)"
 
         drop comment "Default drop"
@@ -483,14 +575,15 @@ EOF
   systemctl restart nftables >/dev/null 2>&1 || true
   stop_spinner_ok
 
-  ok "nftables применён. WAN_IF=${wan_if}. NODE_API_PORT=CONTROL_PORT=${control_port}."
+  ok "nftables применён. WAN_IF=${wan_if}, NODE_API_PORT=${node_api_port}"
 }
 
+# ===== Observer install =====
 clone_or_update_repo() {
   local dst="/opt/remnawave-observer"
   local url="https://github.com/0FL01/remnawave-observer.git"
-
   mkdir -p /opt
+
   if [[ -d "${dst}/.git" ]]; then
     start_spinner "Обновляю репозиторий в ${dst}"
     git -C "${dst}" fetch --all --prune >/dev/null
@@ -580,8 +673,7 @@ EOF
 
 patch_compose_add_services() {
   python3 - <<'PY'
-import sys, os
-import yaml
+import sys, os, yaml
 
 compose_path = "/opt/remnanode/docker-compose.yml"
 
@@ -610,8 +702,7 @@ blocker = {
   "logging": {"driver":"json-file","options":{"max-size":"8m","max-file":"5"}},
   "env_file": [".env"],
   "cap_add": ["NET_ADMIN","NET_RAW"],
-  "depends_on": ["remnanode"],
-  "deploy": {"resources":{"limits":{"memory":"64M","cpus":"0.25"},"reservations":{"memory":"32M","cpus":"0.10"}}}
+  "depends_on": ["remnanode"]
 }
 
 vector = {
@@ -623,8 +714,7 @@ vector = {
   "command": ["--config", "/etc/vector/vector.toml"],
   "depends_on": ["remnanode"],
   "volumes": ["./vector.toml:/etc/vector/vector.toml:ro","/var/log/remnanode:/var/log/remnanode:ro"],
-  "logging": {"driver":"json-file","options":{"max-size":"8m","max-file":"3"}},
-  "deploy": {"resources":{"limits":{"memory":"128M","cpus":"0.25"},"reservations":{"memory":"64M","cpus":"0.10"}}}
+  "logging": {"driver":"json-file","options":{"max-size":"8m","max-file":"3"}}
 }
 
 changed = False
@@ -651,14 +741,11 @@ compose_apply_safely() {
     start_spinner "docker compose down (только потому что compose изменён)"
     (cd /opt/remnanode && docker compose down --remove-orphans) >/dev/null 2>&1 || true
     stop_spinner_ok
-    start_spinner "docker compose up -d"
-    (cd /opt/remnanode && docker compose up -d) >/dev/null
-    stop_spinner_ok
-  else
-    start_spinner "docker compose up -d (без down)"
-    (cd /opt/remnanode && docker compose up -d) >/dev/null
-    stop_spinner_ok
   fi
+
+  start_spinner "docker compose up -d"
+  (cd /opt/remnanode && docker compose up -d) >/dev/null
+  stop_spinner_ok
 }
 
 show_logs_and_status() {
@@ -672,69 +759,75 @@ show_logs_and_status() {
   docker logs --tail 200 vector 2>/dev/null || true
 }
 
+# ===== Main =====
 main() {
   require_root
   clear || true
-  echo -e "${CY}${B0}=== Observer Node Installer + (optional) VPS setup ===${R0}"
+  echo -e "${CY}${B0}=== Observer Node Installer + (optional) VPS setup + (optional) VPN-safe nftables ===${R0}"
   echo
 
-  SETUP_VPS="$(read_yes_no_default_yes "Настраивать VPS (root пароль, SSH порт, Fail2Ban)?")"
+  local DO_VPS
+  DO_VPS="$(read_yes_no_default_yes "Настраивать VPS (root пароль, SSH порт, Fail2Ban)?")"
+
+  local APPLY_NFT
   APPLY_NFT="$(read_yes_no_default_yes "Применить VPN-safe nftables.conf (рекомендую: y)?")"
 
-  apt_install ca-certificates curl iproute2 coreutils git python3 python3-yaml nftables netcat-openbsd openssh-server
+  # Base deps (без sysctl/ufw твиков — как ты просил)
+  apt_install ca-certificates curl iproute2 coreutils nftables netcat-openbsd openssh-server
+  ensure_git_python_yaml
   ensure_docker
 
-  # --- VPS части: root/ssh/fail2ban ---
-  if [[ "$SETUP_VPS" == "y" ]]; then
-    echo
-    set_root_password
-    echo
+  local SSH_PORT_CURRENT=""
+  SSH_PORT_CURRENT="$(detect_ssh_port)"
+  ok "Текущий SSH порт: ${SSH_PORT_CURRENT}"
 
-    read_nonempty "Новый SSH порт (например 5129):" SSH_PORT 0
-    validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
+  local SSH_PORT_NEW="$SSH_PORT_CURRENT"
+
+  if [[ "$DO_VPS" == "y" ]]; then
+    echo
+    info "VPS настройка включена"
+    set_root_password_generated
+
+    read_nonempty "Новый SSH порт (например 5129):" SSH_PORT_NEW 0
+    validate_port "${SSH_PORT_NEW}" || die "Порт SSH невалидный"
 
     ensure_run_sshd_dir
-    ssh_change_port_only "${SSH_PORT}"
+    ssh_change_port "${SSH_PORT_NEW}"
 
-    setup_fail2ban_sshd_only
+    setup_fail2ban
   else
     warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban не трогаю."
   fi
 
-  # --- nftables: отдельно от VPS ---
+  # nftables можно применять независимо от DO_VPS (и это важно для blocker-xray)
   if [[ "$APPLY_NFT" == "y" ]]; then
-    # Если SSH_PORT не спрашивали (SETUP_VPS=n), берём текущий порт из sshd -T, иначе — введённый.
-    if [[ -z "${SSH_PORT:-}" ]]; then
-      SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
-      [[ -n "${SSH_PORT:-}" ]] || SSH_PORT="22"
-      ok "Текущий SSH_PORT определён как: ${SSH_PORT}"
+    echo
+    info "Настройка nftables (VPN-safe + Observer sets)"
+
+    local SSH_FOR_NFT="$SSH_PORT_NEW"
+    # Если VPS-настройка была выключена — дадим возможность уточнить порт для define (по умолчанию текущий)
+    if [[ "$DO_VPS" == "n" ]]; then
+      read_with_default "SSH_PORT для nftables (текущий порт SSH):" "${SSH_FOR_NFT}" SSH_FOR_NFT
+      validate_port "$SSH_FOR_NFT" || die "SSH_PORT невалидный"
     fi
 
+    local CONTROL_PORT MONITORING_PORT
     read_with_default "CONTROL_PORT (порт ноды / API):" "3000" CONTROL_PORT
     validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
-
-    NODE_API_PORT="${CONTROL_PORT}" # auto
 
     read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
     validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
 
-    read_nonempty "IPv4 адрес главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
-    read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
+    local CONTROL_IPS MONITOR_IPS
+    read_nonempty "IPv4 адрес(а) главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
+    read_nonempty "IPv4 адрес(а) monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
 
-    WAN_IF="$(detect_wan_if)"
-    if [[ "${WAN_IF}" != "eth0" ]]; then
-      warn "WAN интерфейс не eth0. Определён: ${WAN_IF}"
-    else
-      ok "WAN интерфейс: ${WAN_IF}"
-    fi
-
-    write_nftables_safe_conf \
-      "${SSH_PORT}" \
+    write_and_apply_nftables_vpn_safe \
+      "${SSH_FOR_NFT}" \
       "${CONTROL_PORT}" \
       "${MONITORING_PORT}" \
       "${CONTROL_IPS}" \
-      "${MONITOR_IPS}" \
-      "${WAN_IF}"
+      "${MONITOR_IPS}"
   else
     warn "nftables пропущен: /etc/nftables.conf не меняю."
   fi
@@ -743,10 +836,9 @@ main() {
   echo -e "${MG}${B0}=== Установка Observer (Blocker + Vector) на ноду ===${R0}"
   echo
 
-  # observer repo нужен только как “официальная точка”, но ставим мы blocker+vector в remnanode
-  # и sets user_blacklist уже существуют/работают при твоём nftables.conf.
   clone_or_update_repo
 
+  local OBS_DOMAIN RABBITMQ_URL
   read_nonempty "Домен центрального Observer (пример: obs.example.com):" OBS_DOMAIN 0
   OBS_DOMAIN="$(echo "$OBS_DOMAIN" | sed -E 's#^https?://##; s#/.*$##')"
   [[ -n "$OBS_DOMAIN" ]] || die "Домен пустой"
@@ -762,8 +854,10 @@ main() {
   render_vector_toml_exact "${OBS_DOMAIN}"
 
   start_spinner "Правлю /opt/remnanode/docker-compose.yml (blocker-xray + vector)"
+  local out
   out="$(patch_compose_add_services)"
   stop_spinner_ok
+
   if [[ "${out:-}" == "NOCHANGE" ]]; then
     ok "docker-compose.yml уже содержит blocker-xray/vector"
   else
@@ -777,6 +871,7 @@ main() {
   echo
 
   echo -e "${WT}${B0}Проверка доступа к RabbitMQ:${R0}"
+  local host port
   host="$(echo "$RABBITMQ_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+).*$#\2#')"
   port="$(echo "$RABBITMQ_URL" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+):([0-9]+).*$#\3#p')"
   [[ -n "${port:-}" ]] || port="38214"
@@ -785,9 +880,15 @@ main() {
 
   show_logs_and_status
 
-  if [[ "$SETUP_VPS" == "y" ]]; then
-    echo
-    echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
+  echo
+  if [[ "$DO_VPS" == "y" ]]; then
+    echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT_NEW} root@<IP>${R0}"
+  else
+    echo -e "${YL}${B0}ВАЖНО:${R0} VPS-настройка была пропущена — SSH/пароль не менялись."
+  fi
+
+  if [[ "$APPLY_NFT" == "y" ]]; then
+    echo -e "${YL}${B0}ВАЖНО:${R0} blocker-xray использует set: ${B0}inet firewall user_blacklist${R0} (он создан в /etc/nftables.conf)."
   fi
 }
 
