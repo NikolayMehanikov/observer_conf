@@ -111,6 +111,21 @@ read_with_default() {
   printf -v "${varname}" '%s' "${value}"
 }
 
+read_yes_no_default_yes() {
+  local prompt="$1"
+  local ans=""
+  while :; do
+    read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}[Y/n]${R0} ")" ans || true
+    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$ans" ]] && ans="y"
+    case "$ans" in
+      y|yes) echo "y"; return 0 ;;
+      n|no)  echo "n"; return 0 ;;
+      *) warn "Введи y или n." ;;
+    esac
+  done
+}
+
 validate_port() {
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -285,6 +300,12 @@ EOF
   echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии: ${B0}ssh -p ${new_port} root@<IP>${R0}"
 }
 
+set_root_password() {
+  echo -e "${CY}${B0}Смена пароля root:${R0}"
+  passwd root
+  ok "Пароль root изменён"
+}
+
 setup_fail2ban_sshd_only() {
   apt_install fail2ban
   start_spinner "Настройка Fail2Ban (sshd, maxretry=7)"
@@ -304,13 +325,13 @@ EOF
 }
 
 detect_wan_if() {
-  # Определяем интерфейс, через который идёт дефолтный маршрут
   local dev=""
   dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   if [[ -z "$dev" ]]; then
     dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
   fi
   [[ -n "$dev" ]] || die "Не смог определить WAN интерфейс. Покажи: ip route; ip -br link"
+  ip link show "$dev" >/dev/null 2>&1 || die "WAN интерфейс '$dev' не найден в системе"
   echo "$dev"
 }
 
@@ -661,58 +682,65 @@ show_logs_and_status() {
 main() {
   require_root
   clear || true
-  echo -e "${CY}${B0}=== SSH (port) + Fail2Ban (7 tries) + Observer Node (safe nftables) ===${R0}"
+  echo -e "${CY}${B0}=== Observer Node Installer + (optional) VPS setup ===${R0}"
   echo
 
-  # Минимум пакетов: sshd, fail2ban, nftables, docker deps для observer
-  apt_install ca-certificates curl iproute2 openssh-server coreutils nftables netcat-openbsd
-  ensure_git_python_yaml
+  SETUP_VPS="$(read_yes_no_default_yes "Настраивать VPS (root пароль, SSH порт, Fail2Ban)?")"
+
+  # Всегда нужны пакеты для observer/compose патча
+  apt_install ca-certificates curl iproute2 coreutils git python3 python3-yaml nftables netcat-openbsd openssh-server
   ensure_docker
 
-  read_nonempty "Новый SSH порт (например 5129):" SSH_PORT 0
-  validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
+  if [[ "$SETUP_VPS" == "y" ]]; then
+    echo
+    set_root_password
+    echo
 
-  read_with_default "CONTROL_PORT (порт ноды / API):" "3000" CONTROL_PORT
-  validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
+    read_nonempty "Новый SSH порт (например 5129):" SSH_PORT 0
+    validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
 
-  # NODE_API_PORT = CONTROL_PORT (автоматически, как ты попросил)
-  NODE_API_PORT="${CONTROL_PORT}"
+    read_with_default "CONTROL_PORT (порт ноды / API):" "3000" CONTROL_PORT
+    validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
 
-  read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
-  validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
+    # NODE_API_PORT = CONTROL_PORT (автоматически)
+    NODE_API_PORT="${CONTROL_PORT}"
 
-  read_nonempty "IPv4 адрес главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
-  read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
+    read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
+    validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
 
-  # WAN_IF автодетект
-  WAN_IF="$(detect_wan_if)"
-  if [[ "${WAN_IF}" != "eth0" ]]; then
-    warn "WAN интерфейс не eth0. Определён: ${WAN_IF}"
+    read_nonempty "IPv4 адрес главного сервера (панель/Control plane) (можно несколько через запятую):" CONTROL_IPS 0
+    read_nonempty "IPv4 адрес monitoring (если нет отдельного — введи тот же) (можно несколько через запятую):" MONITOR_IPS 0
+
+    WAN_IF="$(detect_wan_if)"
+    if [[ "${WAN_IF}" != "eth0" ]]; then
+      warn "WAN интерфейс не eth0. Определён: ${WAN_IF}"
+    else
+      ok "WAN интерфейс: ${WAN_IF}"
+    fi
+
+    ensure_run_sshd_dir
+    ssh_change_port_only "${SSH_PORT}"
+
+    setup_fail2ban_sshd_only
+
+    # Пишем nftables.conf (VPN-safe + пинги не режем)
+    write_nftables_safe_conf \
+      "${SSH_PORT}" \
+      "${CONTROL_PORT}" \
+      "${MONITORING_PORT}" \
+      "${NODE_API_PORT}" \
+      "${CONTROL_IPS}" \
+      "${MONITOR_IPS}" \
+      "${WAN_IF}"
   else
-    ok "WAN интерфейс: ${WAN_IF}"
+    warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban / nftables не трогаю."
   fi
 
   echo
-  ensure_run_sshd_dir
-  ssh_change_port_only "${SSH_PORT}"
-
-  setup_fail2ban_sshd_only
+  echo -e "${MG}${B0}=== Установка Observer (Blocker + Vector) на ноду ===${R0}"
+  echo
 
   clone_or_update_repo
-
-  # Пишем nftables.conf "правильным образом" (VPN-safe + пинги не режем)
-  write_nftables_safe_conf \
-    "${SSH_PORT}" \
-    "${CONTROL_PORT}" \
-    "${MONITORING_PORT}" \
-    "${NODE_API_PORT}" \
-    "${CONTROL_IPS}" \
-    "${MONITOR_IPS}" \
-    "${WAN_IF}"
-
-  echo
-  echo -e "${MG}${B0}=== Установка Blocker + Vector на ноду ===${R0}"
-  echo
 
   read_nonempty "Домен центрального Observer (пример: obs.example.com):" OBS_DOMAIN 0
   OBS_DOMAIN="$(echo "$OBS_DOMAIN" | sed -E 's#^https?://##; s#/.*$##')"
@@ -743,10 +771,6 @@ main() {
   ok "Готово"
   echo
 
-  echo -e "${WT}${B0}Порты на хосте:${R0}"
-  ss -lntp | grep -E ":${SSH_PORT}\b|:${CONTROL_PORT}\b|:80\b|:443\b|:${MONITORING_PORT}\b" || true
-  echo
-
   echo -e "${WT}${B0}Проверка доступа к RabbitMQ:${R0}"
   host="$(echo "$RABBITMQ_URL" | sed -E 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+).*$#\2#')"
   port="$(echo "$RABBITMQ_URL" | sed -nE 's#^[a-zA-Z0-9+.-]+://([^/@]+@)?([^/:]+):([0-9]+).*$#\3#p')"
@@ -756,10 +780,12 @@ main() {
 
   show_logs_and_status
 
-  echo
-  echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
-  echo -e "${YL}${B0}ВАЖНО:${R0} NODE_API_PORT автоматически = CONTROL_PORT = ${CONTROL_PORT}"
-  echo -e "${YL}${B0}ВАЖНО:${R0} WAN_IF автоопределён как: ${WAN_IF}"
+  if [[ "$SETUP_VPS" == "y" ]]; then
+    echo
+    echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
+    echo -e "${YL}${B0}ВАЖНО:${R0} NODE_API_PORT автоматически = CONTROL_PORT = ${CONTROL_PORT}"
+    echo -e "${YL}${B0}ВАЖНО:${R0} WAN_IF автоопределён как: ${WAN_IF}"
+  fi
 }
 
 main "$@"
