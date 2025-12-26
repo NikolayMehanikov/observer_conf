@@ -167,14 +167,6 @@ normalize_ipv4_list_to_nft_elements() {
   echo "$joined"
 }
 
-ensure_git_python_yaml() {
-  local need=()
-  cmd_exists git || need+=(git)
-  cmd_exists python3 || need+=(python3)
-  python3 -c "import yaml" >/dev/null 2>&1 || need+=(python3-yaml)
-  ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
-}
-
 ensure_docker() {
   if ! cmd_exists docker; then
     warn "Docker не найден. Ставлю docker.io + compose plugin."
@@ -339,15 +331,15 @@ write_nftables_safe_conf() {
   local ssh_port="$1"
   local control_port="$2"
   local monitoring_port="$3"
-  local node_api_port="$4"
-  local control_ips_csv="$5"
-  local monitoring_ips_csv="$6"
-  local wan_if="$7"
+  local control_ips_csv="$4"
+  local monitoring_ips_csv="$5"
+  local wan_if="$6"
+
+  local node_api_port="$control_port" # auto
 
   validate_port "$ssh_port" || die "SSH_PORT невалидный"
   validate_port "$control_port" || die "CONTROL_PORT невалидный"
   validate_port "$monitoring_port" || die "MONITORING_PORT невалидный"
-  validate_port "$node_api_port" || die "NODE_API_PORT невалидный"
 
   local control_elems monitoring_elems
   control_elems="$(normalize_ipv4_list_to_nft_elements "$control_ips_csv")"
@@ -408,6 +400,7 @@ table inet firewall {
 
         ip saddr @user_blacklist drop comment "Drop traffic from policy violators (Observer IP-limit)"
 
+        # (Как у тебя в рабочих конфигах)
         ip6 version 6 drop comment "Block IPv6 completely"
 
         iif != lo ip saddr 127.0.0.0/8 drop comment "Block spoofed loopback from external"
@@ -430,10 +423,11 @@ table inet firewall {
 
         ct state established,related accept comment "Allow established forward"
 
-        # VPN-safe: разрешаем контейнерным/приватным подсетям ходить в интернет через WAN
-        oifname \$WAN_IF ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment "Allow private->WAN forward (docker/lan)"
+        # Ключ к тому, чтобы НЕ ломать VPN/контейнеры:
+        # разрешаем приватным подсетям выходить в интернет через WAN интерфейс.
+        oifname \$WAN_IF ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment "Allow private->WAN forward (vpn/docker)"
 
-        # На всякий случай для стандартного docker0
+        # Docker0 (если используется)
         iifname "docker0" accept comment "Allow docker0 forward in"
         oifname "docker0" accept comment "Allow docker0 forward out"
     }
@@ -452,11 +446,11 @@ table inet firewall {
         ip saddr @ddos_blacklist drop comment "Drop known DDoS sources"
         ip saddr @user_blacklist drop comment "Drop Observer-banned IPs (defense-in-depth)"
 
-        # ICMP ошибки/PMTU + обычный ping (мы НЕ запрещаем пинги)
+        # Пинги НЕ запрещаем
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "Allow ICMP errors"
         ip protocol icmp icmp type echo-request accept comment "Allow ICMP ping"
 
-        # TCP SYN probes (tcp ping)
+        # TCP ping / SYN probes
         tcp flags & (syn|ack) == syn ct state new accept comment "Allow TCP SYN probes"
 
         # SSH
@@ -467,9 +461,8 @@ table inet firewall {
         ip saddr @control_plane_sources tcp dport \$NODE_API_PORT ct state new accept comment "Remnawave node API"
         ip saddr @monitoring_sources     tcp dport \$MONITORING_PORT ct state new accept comment "Monitoring"
 
-        # TLS / HTTP
+        # Web
         ip saddr @tls_flood_sources drop comment "Drop TLS flooded IPs"
-
         tcp dport 443 ct state new accept comment "HTTPS"
         tcp dport 80  ct state new accept comment "HTTP (cert renewal)"
 
@@ -490,7 +483,7 @@ EOF
   systemctl restart nftables >/dev/null 2>&1 || true
   stop_spinner_ok
 
-  ok "nftables применён. WAN_IF=${wan_if}. NODE_API_PORT=${node_api_port} (auto=CONTROL_PORT)."
+  ok "nftables применён. WAN_IF=${wan_if}. NODE_API_PORT=CONTROL_PORT=${control_port}."
 }
 
 clone_or_update_repo() {
@@ -686,11 +679,12 @@ main() {
   echo
 
   SETUP_VPS="$(read_yes_no_default_yes "Настраивать VPS (root пароль, SSH порт, Fail2Ban)?")"
+  APPLY_NFT="$(read_yes_no_default_yes "Применить VPN-safe nftables.conf (рекомендую: y)?")"
 
-  # Всегда нужны пакеты для observer/compose патча
   apt_install ca-certificates curl iproute2 coreutils git python3 python3-yaml nftables netcat-openbsd openssh-server
   ensure_docker
 
+  # --- VPS части: root/ssh/fail2ban ---
   if [[ "$SETUP_VPS" == "y" ]]; then
     echo
     set_root_password
@@ -699,11 +693,27 @@ main() {
     read_nonempty "Новый SSH порт (например 5129):" SSH_PORT 0
     validate_port "${SSH_PORT}" || die "Порт SSH невалидный"
 
+    ensure_run_sshd_dir
+    ssh_change_port_only "${SSH_PORT}"
+
+    setup_fail2ban_sshd_only
+  else
+    warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban не трогаю."
+  fi
+
+  # --- nftables: отдельно от VPS ---
+  if [[ "$APPLY_NFT" == "y" ]]; then
+    # Если SSH_PORT не спрашивали (SETUP_VPS=n), берём текущий порт из sshd -T, иначе — введённый.
+    if [[ -z "${SSH_PORT:-}" ]]; then
+      SSH_PORT="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}')"
+      [[ -n "${SSH_PORT:-}" ]] || SSH_PORT="22"
+      ok "Текущий SSH_PORT определён как: ${SSH_PORT}"
+    fi
+
     read_with_default "CONTROL_PORT (порт ноды / API):" "3000" CONTROL_PORT
     validate_port "${CONTROL_PORT}" || die "CONTROL_PORT невалидный"
 
-    # NODE_API_PORT = CONTROL_PORT (автоматически)
-    NODE_API_PORT="${CONTROL_PORT}"
+    NODE_API_PORT="${CONTROL_PORT}" # auto
 
     read_with_default "MONITORING_PORT (обычно 9100):" "9100" MONITORING_PORT
     validate_port "${MONITORING_PORT}" || die "MONITORING_PORT невалидный"
@@ -718,28 +728,23 @@ main() {
       ok "WAN интерфейс: ${WAN_IF}"
     fi
 
-    ensure_run_sshd_dir
-    ssh_change_port_only "${SSH_PORT}"
-
-    setup_fail2ban_sshd_only
-
-    # Пишем nftables.conf (VPN-safe + пинги не режем)
     write_nftables_safe_conf \
       "${SSH_PORT}" \
       "${CONTROL_PORT}" \
       "${MONITORING_PORT}" \
-      "${NODE_API_PORT}" \
       "${CONTROL_IPS}" \
       "${MONITOR_IPS}" \
       "${WAN_IF}"
   else
-    warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban / nftables не трогаю."
+    warn "nftables пропущен: /etc/nftables.conf не меняю."
   fi
 
   echo
   echo -e "${MG}${B0}=== Установка Observer (Blocker + Vector) на ноду ===${R0}"
   echo
 
+  # observer repo нужен только как “официальная точка”, но ставим мы blocker+vector в remnanode
+  # и sets user_blacklist уже существуют/работают при твоём nftables.conf.
   clone_or_update_repo
 
   read_nonempty "Домен центрального Observer (пример: obs.example.com):" OBS_DOMAIN 0
@@ -783,8 +788,6 @@ main() {
   if [[ "$SETUP_VPS" == "y" ]]; then
     echo
     echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT} root@<IP>${R0}"
-    echo -e "${YL}${B0}ВАЖНО:${R0} NODE_API_PORT автоматически = CONTROL_PORT = ${CONTROL_PORT}"
-    echo -e "${YL}${B0}ВАЖНО:${R0} WAN_IF автоопределён как: ${WAN_IF}"
   fi
 }
 
