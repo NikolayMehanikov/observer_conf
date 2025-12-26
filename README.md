@@ -8,5 +8,5 @@ bash <(curl -sSL https://raw.githubusercontent.com/NikolayMehanikov/observer_con
 ```
 observer_without_confvps
 ```sh
-bash <(curl -sSL https://github.com/NikolayMehanikov/observer_conf/raw/refs/heads/main/observer_without_confvps)
+bash <(curl -sSL https://github.com/NikolayMehanikov/observer_conf/raw/refs/heads/main/observer_without_confvps.sh)
 ```
