@@ -362,7 +362,12 @@ EOF
 
 # ===== Root password =====
 generate_root_password() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+  # Без пайпов → не ловим SIGPIPE при pipefail
+  python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(24)))
+PY
 }
 
 set_root_password_generated() {
