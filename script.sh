@@ -198,7 +198,6 @@ detect_wan_if() {
 }
 
 detect_ssh_port() {
-  # 1) sshd -T (если доступно)
   if cmd_exists sshd; then
     local p=""
     p="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}' || true)"
@@ -208,7 +207,6 @@ detect_ssh_port() {
     fi
   fi
 
-  # 2) ss: LISTEN sshd
   if cmd_exists ss; then
     local p2=""
     p2="$(ss -lntp 2>/dev/null | awk '
@@ -222,7 +220,6 @@ detect_ssh_port() {
     fi
   fi
 
-  # 3) parse configs
   local ports=()
   local f
   if [[ -f /etc/ssh/sshd_config ]]; then
@@ -365,7 +362,6 @@ EOF
 
 # ===== Root password =====
 generate_root_password() {
-  # 24 chars: letters+digits
   tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
 }
 
@@ -397,7 +393,7 @@ EOF
   ok "Fail2Ban активирован"
 }
 
-# ===== nftables (VPN-safe + Observer sets) =====
+# ===== nftables (exact as your example, but WAN_IF autodetect + NODE_API_PORT=CONTROL_PORT) =====
 write_and_apply_nftables_vpn_safe() {
   local ssh_port="$1"
   local control_port="$2"
@@ -418,7 +414,7 @@ write_and_apply_nftables_vpn_safe() {
 
   local node_api_port="$control_port" # NODE_API_PORT = CONTROL_PORT (как просил)
 
-  start_spinner "Пишу /etc/nftables.conf (VPN-safe, Observer-compatible)"
+  start_spinner "Пишу /etc/nftables.conf (как в твоём примере, WAN_IF авто)"
   backup_file /etc/nftables.conf
 
   cat > /etc/nftables.conf <<EOF
@@ -431,7 +427,9 @@ define CONTROL_PORT    = ${control_port}
 define MONITORING_PORT = ${monitoring_port}
 define NODE_API_PORT   = ${node_api_port}
 define WEB_PORTS       = { 80, 443 }
-define WAN_IF          = "${wan_if}"
+
+# Внешний интерфейс (авто-детект)
+define WAN_IF = "${wan_if}"
 
 table inet firewall {
 
@@ -465,18 +463,19 @@ table inet firewall {
         flags timeout
         timeout 15m
         size 4096
+        comment "Temporary TLS flood sources"
     }
 
+    #
+    # RAW / PREROUTING
+    #
     chain prerouting {
         type filter hook prerouting priority raw; policy accept;
 
-        # Observer bans (важно для blocker-xray)
         ip saddr @user_blacklist drop comment "Drop traffic from policy violators (Observer IP-limit)"
 
-        # IPv6 off (как у тебя)
         ip6 version 6 drop comment "Block IPv6 completely"
 
-        # Анти-спуфинг/мусор
         iif != lo ip saddr 127.0.0.0/8 drop comment "Block spoofed loopback from external"
         ip frag-off & 0x1fff != 0 drop comment "Drop fragmented packets"
 
@@ -492,28 +491,33 @@ table inet firewall {
         ip saddr @ddos_blacklist drop comment "Drop blacklisted source early"
     }
 
+    #
+    # FORWARD (ВАЖНО для docker/compose, чтобы не ломался интернет под VPN)
+    #
     chain forward {
         type filter hook forward priority filter; policy drop;
 
         ct state established,related accept comment "Allow established forward"
 
-        # Docker / compose networks (без regex, чтобы не ловить синтакс-ошибки)
+        # Разрешаем форвард из контейнерных/приватных подсетей в интернет через WAN
+        # (это главная штука, которая обычно чинит "VPN есть, но интернета нет")
+        oifname \$WAN_IF ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment "Allow private->WAN forward (docker/lan)"
+
+        # На всякий: если у тебя реально используется docker0 как iif/oif
         iifname "docker0" accept comment "Allow docker0 forward in"
         oifname "docker0" accept comment "Allow docker0 forward out"
-        iifname "br-*" accept comment "Allow docker bridge forward in"
-        oifname "br-*" accept comment "Allow docker bridge forward out"
-
-        # Если вдруг есть tun0/wg0 (не мешает, а иногда спасает)
-        iifname "tun0" oifname \$WAN_IF accept comment "Allow tun0 -> WAN"
-        iifname \$WAN_IF oifname "tun0" accept comment "Allow WAN -> tun0"
-        iifname "wg0"  oifname \$WAN_IF accept comment "Allow wg0 -> WAN"
-        iifname \$WAN_IF oifname "wg0"  accept comment "Allow WAN -> wg0"
     }
 
+    #
+    # OUTPUT
+    #
     chain output {
         type filter hook output priority filter; policy accept;
     }
 
+    #
+    # INPUT
+    #
     chain filter_input {
         type filter hook input priority filter; policy drop;
 
@@ -521,42 +525,50 @@ table inet firewall {
         ct state invalid drop comment "Drop invalid packets"
         ct state established,related accept comment "Allow established"
 
-        # Defense-in-depth (второй барьер)
         ip saddr @ddos_blacklist drop comment "Drop known DDoS sources"
-        ip saddr @user_blacklist drop comment "Drop Observer-banned IPs"
+        ip saddr @user_blacklist drop comment "Drop Observer-banned IPs (defense-in-depth)"
 
-        #
-        # ICMP: НЕ ЛОМАЕМ ping и сетевые ошибки/PMTU
-        #
+        # ICMP ошибки + PMTU
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "Allow ICMP errors"
-        ip protocol icmp icmp type echo-request limit rate 10/second burst 20 packets accept comment "Allow ICMP ping (limited)"
-        ip protocol icmp icmp type echo-request add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist ICMP flooders"
 
-        #
-        # TCP SYN probe (tcp-ping тестеры)
-        #
-        tcp flags & (syn|ack) == syn ct state new limit rate 400/second burst 400 packets accept comment "Allow TCP SYN probes"
-        tcp flags & (syn|ack) == syn ct state new add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist TCP SYN flooders"
+        # Ping с лимитом
+        ip protocol icmp icmp type echo-request \\
+            meter icmp_ping_meter size 65535 { ip saddr limit rate 5/second burst 10 packets } \\
+            accept comment "Allow ICMP ping (limited)"
+        ip protocol icmp icmp type echo-request \\
+            add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist ICMP ping flooders"
 
-        #
-        # SSH (порт задаётся define)
-        #
-        tcp dport \$SSH_PORT ct state new accept comment "SSH"
+        # TCP SYN probes (tcp ping)
+        tcp flags & (syn|ack) == syn ct state new \\
+            meter tcp_syn_probe size 65535 { ip saddr limit rate 200/second burst 200 packets } \\
+            accept comment "Allow TCP SYN probes (TCP ping)"
+        tcp flags & (syn|ack) == syn ct state new \\
+            add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist TCP SYN flooders"
 
-        #
-        # Control / Node API / Monitoring (строго по source IP)
-        #
+        # SSH rate-limit
+        tcp dport \$SSH_PORT ct state new \\
+            meter ssh_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \\
+            accept comment "SSH rate limit"
+        tcp dport \$SSH_PORT ct state new \\
+            add @ddos_blacklist { ip saddr timeout 5m } drop comment "SSH flood → blacklist"
+
+        # Control/NodeAPI/Monitoring только от своих
         ip saddr @control_plane_sources tcp dport \$CONTROL_PORT ct state new accept comment "Control plane"
         ip saddr @control_plane_sources tcp dport \$NODE_API_PORT ct state new accept comment "Remnawave node API"
         ip saddr @monitoring_sources     tcp dport \$MONITORING_PORT ct state new accept comment "Monitoring"
 
-        #
-        # WEB (80/443) — пропускаем, но защищаемся от явного TLS-flood
-        #
+        # TLS/HTTP
         ip saddr @tls_flood_sources drop comment "Drop TLS flooded IPs"
-        tcp dport 443 ct state new limit rate 800/second burst 800 packets accept comment "TLS connections"
-        tcp dport 443 ct state new add @tls_flood_sources { ip saddr timeout 15m } drop comment "TLS flood -> temp block"
-        tcp dport 80  ct state new accept comment "HTTP (cert renewal)"
+
+        tcp dport 443 ct state new \\
+            meter tls_meter size 65535 { ip saddr limit rate 400/second burst 300 packets } \\
+            accept comment "TLS connections"
+        tcp dport 443 ct state new \\
+            add @tls_flood_sources { ip saddr timeout 15m } drop comment "TLS flood → temp block"
+
+        tcp dport 80 ct state new \\
+            meter cert_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \\
+            accept comment "HTTP cert renewal"
 
         drop comment "Default drop"
     }
@@ -772,7 +784,7 @@ main() {
   local APPLY_NFT
   APPLY_NFT="$(read_yes_no_default_yes "Применить VPN-safe nftables.conf (рекомендую: y)?")"
 
-  # Base deps (без sysctl/ufw твиков — как ты просил)
+  # Base deps
   apt_install ca-certificates curl iproute2 coreutils nftables netcat-openbsd openssh-server
   ensure_git_python_yaml
   ensure_docker
@@ -799,13 +811,11 @@ main() {
     warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban не трогаю."
   fi
 
-  # nftables можно применять независимо от DO_VPS (и это важно для blocker-xray)
   if [[ "$APPLY_NFT" == "y" ]]; then
     echo
-    info "Настройка nftables (VPN-safe + Observer sets)"
+    info "Настройка nftables (ровно как в твоём примере)"
 
     local SSH_FOR_NFT="$SSH_PORT_NEW"
-    # Если VPS-настройка была выключена — дадим возможность уточнить порт для define (по умолчанию текущий)
     if [[ "$DO_VPS" == "n" ]]; then
       read_with_default "SSH_PORT для nftables (текущий порт SSH):" "${SSH_FOR_NFT}" SSH_FOR_NFT
       validate_port "$SSH_FOR_NFT" || die "SSH_PORT невалидный"
