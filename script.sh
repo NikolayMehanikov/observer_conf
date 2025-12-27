@@ -537,24 +537,24 @@ table inet firewall {
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "Allow ICMP errors"
 
         # Ping с лимитом
-        ip protocol icmp icmp type echo-request \\
-            meter icmp_ping_meter size 65535 { ip saddr limit rate 5/second burst 10 packets } \\
+        ip protocol icmp icmp type echo-request \
+            meter icmp_ping_meter size 65535 { ip saddr limit rate 5/second burst 10 packets } \
             accept comment "Allow ICMP ping (limited)"
-        ip protocol icmp icmp type echo-request \\
+        ip protocol icmp icmp type echo-request \
             add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist ICMP ping flooders"
 
         # TCP SYN probes (tcp ping)
-        tcp flags & (syn|ack) == syn ct state new \\
-            meter tcp_syn_probe size 65535 { ip saddr limit rate 200/second burst 200 packets } \\
+        tcp flags & (syn|ack) == syn ct state new \
+            meter tcp_syn_probe size 65535 { ip saddr limit rate 200/second burst 200 packets } \
             accept comment "Allow TCP SYN probes (TCP ping)"
-        tcp flags & (syn|ack) == syn ct state new \\
+        tcp flags & (syn|ack) == syn ct state new \
             add @ddos_blacklist { ip saddr timeout 5m } drop comment "Blacklist TCP SYN flooders"
 
         # SSH rate-limit
-        tcp dport \$SSH_PORT ct state new \\
-            meter ssh_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \\
+        tcp dport \$SSH_PORT ct state new \
+            meter ssh_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \
             accept comment "SSH rate limit"
-        tcp dport \$SSH_PORT ct state new \\
+        tcp dport \$SSH_PORT ct state new \
             add @ddos_blacklist { ip saddr timeout 5m } drop comment "SSH flood → blacklist"
 
         # Control/NodeAPI/Monitoring только от своих
@@ -565,14 +565,14 @@ table inet firewall {
         # TLS/HTTP
         ip saddr @tls_flood_sources drop comment "Drop TLS flooded IPs"
 
-        tcp dport 443 ct state new \\
-            meter tls_meter size 65535 { ip saddr limit rate 400/second burst 300 packets } \\
+        tcp dport 443 ct state new \
+            meter tls_meter size 65535 { ip saddr limit rate 400/second burst 300 packets } \
             accept comment "TLS connections"
-        tcp dport 443 ct state new \\
+        tcp dport 443 ct state new \
             add @tls_flood_sources { ip saddr timeout 15m } drop comment "TLS flood → temp block"
 
-        tcp dport 80 ct state new \\
-            meter cert_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \\
+        tcp dport 80 ct state new \
+            meter cert_meter size 65535 { ip saddr limit rate 5/minute burst 3 packets } \
             accept comment "HTTP cert renewal"
 
         drop comment "Default drop"
@@ -803,7 +803,15 @@ main() {
   if [[ "$DO_VPS" == "y" ]]; then
     echo
     info "VPS настройка включена"
-    set_root_password_generated
+
+    # ✅ ДОБАВЛЕНО: отдельно спрашиваем, менять ли root пароль
+    local DO_ROOT_PASS
+    DO_ROOT_PASS="$(read_yes_no_default_yes "Сменить пароль root (сгенерировать новый)?")"
+    if [[ "$DO_ROOT_PASS" == "y" ]]; then
+      set_root_password_generated
+    else
+      warn "Пароль root не меняю."
+    fi
 
     read_nonempty "Новый SSH порт (например 5129):" SSH_PORT_NEW 0
     validate_port "${SSH_PORT_NEW}" || die "Порт SSH невалидный"
