@@ -1,4 +1,3 @@
-cat > /opt/remnawave-observer/blocker_conf/install_node.sh << 'EOFSCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -72,6 +71,29 @@ apt_install() {
   stop_spinner_ok
 }
 
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  cp -a "$f" "${f}.bak.${ts}"
+}
+
+read_yes_no_default_yes() {
+  local prompt="$1"
+  local ans=""
+  while :; do
+    read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}[Y/n]${R0} ")" ans || true
+    ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    [[ -z "$ans" ]] && ans="y"
+    case "$ans" in
+      y|yes) echo "y"; return 0 ;;
+      n|no)  echo "n"; return 0 ;;
+      *) warn "Введи y или n." ;;
+    esac
+  done
+}
+
 read_nonempty() {
   local prompt="$1"
   local varname="$2"
@@ -88,6 +110,24 @@ read_nonempty() {
     value="${value%"${value##*[![:space:]]}"}"
   done
   printf -v "${varname}" '%s' "${value}"
+}
+
+read_with_default() {
+  local prompt="$1"
+  local def="$2"
+  local varname="$3"
+  local value=""
+  read -r -p "$(echo -e "${B0}${prompt}${R0} ${D0}(Enter = ${def})${R0} ")" value || true
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  [[ -z "$value" ]] && value="$def"
+  printf -v "${varname}" '%s' "${value}"
+}
+
+validate_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 ))
 }
 
 # ===== Docker =====
@@ -111,7 +151,207 @@ ensure_git_python_yaml() {
   ((${#need[@]})) && apt_install "${need[@]}" || ok "git/python3/yaml уже есть"
 }
 
-# ===== Observer install =====
+# ===== SSH change (safe) =====
+detect_ssh_port() {
+  if cmd_exists sshd; then
+    local p=""
+    p="$(sshd -T 2>/dev/null | awk '$1=="port"{print $2; exit}' || true)"
+    if [[ -n "${p:-}" ]] && validate_port "$p"; then
+      echo "$p"
+      return 0
+    fi
+  fi
+
+  if cmd_exists ss; then
+    local p2=""
+    p2="$(ss -lntp 2>/dev/null | awk '
+      /LISTEN/ && ($0 ~ /sshd|\/sshd/){
+        match($0, /:([0-9]{1,5})[[:space:]]/, m);
+        if (m[1]!=""){ print m[1]; exit }
+      }' || true)"
+    if [[ -n "${p2:-}" ]] && validate_port "$p2"; then
+      echo "$p2"
+      return 0
+    fi
+  fi
+
+  local ports=()
+  local f
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    while read -r f; do
+      [[ -f "$f" ]] || continue
+      while read -r p; do
+        [[ -n "$p" ]] || continue
+        validate_port "$p" && ports+=("$p")
+      done < <(awk 'BEGIN{IGNORECASE=1} $1=="port"{print $2}' "$f" 2>/dev/null || true)
+    done < <(
+      echo /etc/ssh/sshd_config
+      ls -1 /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+    )
+  fi
+  if ((${#ports[@]})); then
+    echo "${ports[0]}"
+    return 0
+  fi
+
+  echo "22"
+}
+
+detect_ssh_unit() {
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.service'; then echo "ssh"; return 0; fi
+  if systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'sshd.service'; then echo "sshd"; return 0; fi
+  return 1
+}
+
+ensure_run_sshd_dir() {
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+  chown root:root /run/sshd
+}
+
+ensure_sshd_include_dropins() {
+  local main_cfg="/etc/ssh/sshd_config"
+  [[ -f "$main_cfg" ]] || die "Не найден $main_cfg"
+  if grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$' "$main_cfg"; then
+    return 0
+  fi
+  backup_file "$main_cfg"
+  { echo "Include /etc/ssh/sshd_config.d/*.conf"; echo; cat "$main_cfg"; } > "${main_cfg}.tmp"
+  mv "${main_cfg}.tmp" "$main_cfg"
+}
+
+comment_out_other_port_directives() {
+  local keep_file="$1"
+  local main_cfg="/etc/ssh/sshd_config"
+
+  if grep -Eiq '^\s*Port\s+[0-9]+' "$main_cfg"; then
+    backup_file "$main_cfg"
+    sed -i -E 's/^\s*(Port\s+[0-9]+)\s*$/# \1/Ig' "$main_cfg"
+  fi
+
+  shopt -s nullglob
+  local f
+  for f in /etc/ssh/sshd_config.d/*.conf; do
+    [[ "$f" == "$keep_file" ]] && continue
+    if grep -Eiq '^\s*Port\s+[0-9]+' "$f"; then
+      backup_file "$f"
+      sed -i -E 's/^\s*(Port\s+[0-9]+)\s*$/# \1/Ig' "$f"
+    fi
+  done
+  shopt -u nullglob
+}
+
+restart_ssh_and_verify() {
+  local unit="$1"
+  local new_port="$2"
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ensure_run_sshd_dir
+
+  if systemctl list-unit-files --no-pager 2>/dev/null | awk '{print $1}' | grep -qx 'ssh.socket'; then
+    systemctl restart ssh.socket >/dev/null 2>&1 || true
+  fi
+
+  systemctl restart "${unit}" >/dev/null
+
+  systemctl is-active --quiet "${unit}" || {
+    echo -e "${RD}${B0}SSH unit не активен после рестарта.${R0}"
+    journalctl -u "${unit}" -n 160 --no-pager || true
+    die "SSH не поднялся после применения конфига"
+  }
+
+  cmd_exists ss || apt_install iproute2
+  if ! ss -lntp 2>/dev/null | grep -qE "LISTEN.+:${new_port}\b"; then
+    echo -e "${RD}${B0}sshd не слушает порт ${new_port}.${R0}"
+    ss -lntp 2>/dev/null | grep -i ssh || ss -lntp 2>/dev/null || true
+    journalctl -u "${unit}" -n 200 --no-pager || true
+    die "Порт не применился / sshd не слушает новый порт"
+  fi
+}
+
+ssh_change_port() {
+  local new_port="$1"
+  validate_port "$new_port" || die "Неверный порт SSH: $new_port"
+
+  start_spinner "Настройка SSH (порт ${new_port})"
+
+  local dropin_dir="/etc/ssh/sshd_config.d"
+  local dropin_file="${dropin_dir}/99-custom.conf"
+
+  mkdir -p "${dropin_dir}"
+  ensure_sshd_include_dropins
+
+  backup_file "${dropin_file}"
+  cat > "${dropin_file}" <<EOF
+# Managed by installer script
+Port ${new_port}
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication yes
+PrintMotd no
+Banner none
+EOF
+
+  comment_out_other_port_directives "${dropin_file}"
+  ensure_run_sshd_dir
+
+  if cmd_exists sshd && ! sshd -t >/dev/null 2>&1; then
+    stop_spinner_fail
+    sshd -t || true
+    die "sshd_config невалиден после изменений. Проверь ${dropin_file}"
+  fi
+
+  local unit
+  unit="$(detect_ssh_unit)" || { stop_spinner_fail; die "Не нашёл systemd unit ssh/sshd."; }
+
+  restart_ssh_and_verify "${unit}" "${new_port}"
+
+  stop_spinner_ok
+  ok "SSH применён. Новый порт: ${new_port}"
+  echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии: ${B0}ssh -p ${new_port} root@<IP>${R0}"
+}
+
+# ===== Root password =====
+generate_root_password() {
+  python3 - <<'PY'
+import secrets, string
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(24)))
+PY
+}
+
+set_root_password_generated() {
+  local pass
+  pass="$(generate_root_password)"
+  echo "root:${pass}" | chpasswd
+  ok "ROOT пароль установлен (сгенерирован)."
+  echo -e "${YL}${B0}ROOT PASSWORD:${R0} ${B0}${pass}${R0}"
+  echo -e "${D0}Сохрани пароль в безопасном месте.${R0}"
+}
+
+# ===== Fail2Ban =====
+setup_fail2ban() {
+  apt_install fail2ban
+  start_spinner "Настройка Fail2Ban (sshd, maxretry=7)"
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+bantime = 30m
+findtime = 10m
+maxretry = 7
+backend = systemd
+EOF
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban >/dev/null 2>&1 || true
+  stop_spinner_ok
+  ok "Fail2Ban активирован"
+}
+
+# ===== Observer Vector install =====
 ensure_remnanode_paths() {
   [[ -d /opt/remnanode ]] || die "Не найден каталог /opt/remnanode (должна быть установлена RemnaWave нода)"
   [[ -f /opt/remnanode/docker-compose.yml ]] || die "Не найден /opt/remnanode/docker-compose.yml"
@@ -122,27 +362,7 @@ ensure_remnanode_paths() {
   ok "Логи remnanode: /var/log/remnanode"
 }
 
-upsert_env_kv_with_blank_before() {
-  local file="$1"
-  local key="$2"
-  local val="$3"
-  mkdir -p "$(dirname "$file")"
-  touch "$file"
-
-  if grep -qE "^${key}=" "$file"; then
-    sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
-    return 0
-  fi
-
-  local last_line=""
-  if [[ -s "$file" ]]; then
-    last_line="$(tail -n 1 "$file" || true)"
-  fi
-  if [[ -n "$last_line" ]]; then printf "\n" >> "$file"; fi
-  printf "%s=%s\n" "$key" "$val" >> "$file"
-}
-
-render_vector_toml_exact() {
+render_vector_toml() {
   local domain="$1"
   local out="/opt/remnanode/vector.toml"
   local uri="https://${domain}:38213/"
@@ -185,7 +405,7 @@ EOF
   ok "Создан /opt/remnanode/vector.toml → ${uri}"
 }
 
-patch_compose_add_services() {
+patch_compose_add_vector() {
   python3 - <<'PY'
 import sys, os, yaml
 
@@ -261,16 +481,48 @@ show_logs_and_status() {
 main() {
   require_root
   clear || true
-  echo -e "${CY}${B0}=== Observer Vector Installer (только чтение логов Xray → передача в Observer) ===${R0}"
+  echo -e "${CY}${B0}=== Observer Vector Installer (передача логов Xray → Observer) ===${R0}"
   echo
 
+  local DO_VPS
+  DO_VPS="$(read_yes_no_default_yes "Настраивать VPS (root пароль, SSH порт, Fail2Ban)?")"
+
   # Base deps
-  apt_install ca-certificates curl iproute2 coreutils netcat-openbsd
+  apt_install ca-certificates curl iproute2 coreutils netcat-openbsd openssh-server
   ensure_git_python_yaml
   ensure_docker
 
+  local SSH_PORT_CURRENT=""
+  SSH_PORT_CURRENT="$(detect_ssh_port)"
+  ok "Текущий SSH порт: ${SSH_PORT_CURRENT}"
+
+  local SSH_PORT_NEW="$SSH_PORT_CURRENT"
+
+  if [[ "$DO_VPS" == "y" ]]; then
+    echo
+    info "VPS настройка включена"
+
+    local DO_ROOT_PASS
+    DO_ROOT_PASS="$(read_yes_no_default_yes "Сменить пароль root (сгенерировать новый)?")"
+    if [[ "$DO_ROOT_PASS" == "y" ]]; then
+      set_root_password_generated
+    else
+      warn "Пароль root не меняю."
+    fi
+
+    read_nonempty "Новый SSH порт (например 5129):" SSH_PORT_NEW 0
+    validate_port "${SSH_PORT_NEW}" || die "Порт SSH невалидный"
+
+    ensure_run_sshd_dir
+    ssh_change_port "${SSH_PORT_NEW}"
+
+    setup_fail2ban
+  else
+    warn "VPS-настройка пропущена: root пароль / SSH порт / Fail2Ban не трогаю."
+  fi
+
   echo
-  echo -e "${MG}${B0}=== Установка Vector для передачи логов Xray ===${R0}"
+  echo -e "${MG}${B0}=== Установка Vector для передачи логов ===${R0}"
   echo
 
   local OBS_DOMAIN
@@ -280,11 +532,11 @@ main() {
 
   ensure_remnanode_paths
 
-  render_vector_toml_exact "${OBS_DOMAIN}"
+  render_vector_toml "${OBS_DOMAIN}"
 
   start_spinner "Правлю /opt/remnanode/docker-compose.yml (добавляю vector)"
   local out
-  out="$(patch_compose_add_services)"
+  out="$(patch_compose_add_vector)"
   stop_spinner_ok
 
   if [[ "${out:-}" == "NOCHANGE" ]]; then
@@ -308,9 +560,10 @@ main() {
   echo
   echo -e "${GN}${B0}✅ Vector установлен и запущен!${R0}"
   echo -e "${CY}Логи передаются в Observer: https://${OBS_DOMAIN}:38213/${R0}"
+  
+  if [[ "$DO_VPS" == "y" ]]; then
+    echo -e "${YL}${B0}ВАЖНО:${R0} проверь вход в новой сессии SSH: ${B0}ssh -p ${SSH_PORT_NEW} root@<IP>${R0}"
+  fi
 }
 
 main "$@"
-EOFSCRIPT
-
-chmod +x /opt/remnawave-observer/blocker_conf/install_node.sh
